@@ -1,0 +1,25 @@
+[project]
+name = "zuopro"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "lightning==2.4.0",
+    "torch==2.4.1",
+    "torchvision==0.19.1",
+    "torchmetrics>=1.4.1",
+    "pandas==2.2.3",
+    "tensorboard>=2.20.0",
+    "rasterio>=1.5.0",
+    "opencv-python>=4.13.0.92",
+    "pyarrow>=24.0.0",
+    "fastparquet>=2026.5.0",
+    "matplotlib>=3.10.9",
+    "scikit-image>=0.26.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+]
