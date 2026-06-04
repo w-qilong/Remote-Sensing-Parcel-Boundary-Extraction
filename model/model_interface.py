@@ -19,6 +19,7 @@ import torch
 from torch import nn
 from torch.optim import lr_scheduler as schedulers
 from torchmetrics.classification import MulticlassAccuracy, MulticlassRecall
+from losses import LossF
 
 
 class MInterface(L.LightningModule):
@@ -106,6 +107,10 @@ class MInterface(L.LightningModule):
             return nn.MSELoss()
         if loss == "triplet_margin_loss":
             return nn.TripletMarginLoss()
+        if loss == "bce_with_logits":
+            return nn.BCEWithLogitsLoss()
+        if loss == "loss_f":
+            return LossF()
         raise ValueError(f"未支持的损失函数: {loss}")
 
     @staticmethod
@@ -116,11 +121,63 @@ class MInterface(L.LightningModule):
         结束时的统计。新增指标时，请优先选择 torchmetrics 中已有实现。
         """
         metric = metric.lower()
+        if metric == "none":
+            return None
         if metric == "accuracy":
             return MulticlassAccuracy(num_classes=num_classes)
         if metric == "recall":
             return MulticlassRecall(num_classes=num_classes)
         raise ValueError(f"未支持的评价指标: {metric}")
+
+    @staticmethod
+    def _primary_output(output):
+        """从模型输出中取出通用单损失路径使用的主输出张量。"""
+        if isinstance(output, (list, tuple)):
+            return output[0]
+        return output
+
+    @staticmethod
+    def _unpack_batch(batch):
+        """统一解析分类 batch 和 FTW 分割 batch。
+
+        支持两类输入格式：
+        - ``(images, labels)``：普通分类或单任务监督；
+        - ``(names, images, masks, contours, distances)``：FTW/HBGNet 多任务监督。
+        """
+        if len(batch) == 2:
+            if torch.is_tensor(batch[0]):
+                images, labels = batch
+            else:
+                _, images = batch
+                labels = None
+            return images, labels
+        if len(batch) == 5:
+            _, images, masks, _, _ = batch
+            return images, masks
+        raise ValueError(f"Unsupported batch format with {len(batch)} items")
+
+    @staticmethod
+    def _unpack_ftw_batch(batch):
+        """解析 ``LossF`` 必需的 FTW 多任务 batch。"""
+        if len(batch) != 5:
+            raise ValueError("LossF requires FTW batches: (names, images, masks, contours, distances)")
+        _, images, masks, contours, distances = batch
+        return images, masks, contours, distances
+
+    def _compute_loss(self, batch):
+        """根据当前损失函数类型计算单个 batch 的训练或评估损失。"""
+        if isinstance(self.loss_function, LossF):
+            images, masks, contours, distances = self._unpack_ftw_batch(batch)
+            outputs = self(images)
+            if not isinstance(outputs, (list, tuple)) or len(outputs) != 3:
+                raise ValueError("LossF requires HBGNet to return [mask_logits, edge_log_probs, distance_map]")
+            loss = self.loss_function(outputs[0], outputs[1], outputs[2], masks, contours, distances)
+            return loss, images, outputs[0], masks
+
+        images, labels = self._unpack_batch(batch)
+        logits = self._primary_output(self(images))
+        loss = self.loss_function(logits, labels)
+        return loss, images, logits, labels
 
     def forward(self, images):
         """前向传播入口。
@@ -137,15 +194,15 @@ class MInterface(L.LightningModule):
         - val_loss / val_accuracy
         - test_loss / test_accuracy
         """
-        images, labels = batch
-        logits = self(images)
-        loss = self.loss_function(logits, labels)
+        loss, images, logits, labels = self._compute_loss(batch)
         metric = self.valid_metric if stage == "val" else self.test_metric
         # torchmetrics 的 update 会累积当前 batch 的状态，compute 由 Lightning 日志系统触发。
-        metric.update(logits, labels)
+        if metric is not None:
+            metric.update(logits, labels)
         # batch_size 用于 Lightning 在 epoch 级别正确加权聚合 loss/metric。
         self.log(f"{stage}_loss", loss, prog_bar=True, on_epoch=True, batch_size=images.size(0))
-        self.log(f"{stage}_{self.metric_name}", metric, prog_bar=True, on_epoch=True, batch_size=images.size(0))
+        if metric is not None:
+            self.log(f"{stage}_{self.metric_name}", metric, prog_bar=True, on_epoch=True, batch_size=images.size(0))
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -154,9 +211,7 @@ class MInterface(L.LightningModule):
         返回值必须是 loss Tensor，Lightning 会自动执行 backward、optimizer.step、
         zero_grad 等优化流程。除非需要手动优化，一般不要在这里直接调用 optimizer。
         """
-        images, labels = batch
-        logits = self(images)
-        loss = self.loss_function(logits, labels)
+        loss, images, _, _ = self._compute_loss(batch)
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=images.size(0))
         return loss
 
@@ -177,8 +232,11 @@ class MInterface(L.LightningModule):
         默认返回 softmax 后的类别概率。若你的任务是回归、分割或检测，请根据输出格式
         修改这里。
         """
-        images, _ = batch
-        return self(images).softmax(dim=1)
+        images, _ = self._unpack_batch(batch)
+        logits = self._primary_output(self(images))
+        if logits.ndim > 2 and logits.size(1) == 1:
+            return torch.sigmoid(logits)
+        return logits.softmax(dim=1)
 
     def configure_optimizers(self):
         """创建优化器和可选学习率调度器。

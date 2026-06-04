@@ -54,19 +54,17 @@ def build_parser() -> ArgumentParser:
     # 32-true 是最稳妥的全精度训练；需要混合精度时可改成 16-mixed 或 bf16-mixed。
     parser.add_argument("--precision", default="32-true")
     # fast_dev_run 会只跑极少 batch，适合检查数据、模型、loss、日志是否能串起来。
-    parser.add_argument("--fast_dev_run", nargs="?", const=True, default=False, type=str_to_bool)
+    parser.add_argument("--fast_dev_run", nargs="?", const=True, default=False, type=str_to_bool) # TDOD: 调试时设置为 true，正式训练时设置为 false。
     # TensorBoard 日志会写入 log_dir/experiment_name。
     parser.add_argument("--log_dir", default="logs")
-    parser.add_argument("--experiment_name", default="example_net")
+    parser.add_argument("--experiment_name", default="hbg_net_ftw")
     parser.add_argument("--enable_progress_bar", nargs="?", const=True, default=False, type=str_to_bool)
 
-    # 数据参数：名称会被 DInterface 转换为 data/ 下的 Dataset 类。
-    # 例如 --train_dataset example_data 会加载 data/example_data.py 中的 ExampleData。
-    parser.add_argument("--train_dataset", default="example_data")
-    # val/test 支持多个数据集名称，Lightning 会依次对多个 dataloader 做验证或测试。
-    parser.add_argument("--val_datasets", nargs="+", default=["example_data"])
-    parser.add_argument("--test_datasets", nargs="+", default=["example_data"])
-    parser.add_argument("--batch_size", default=32, type=int)
+    # 数据参数：默认使用 FTW 的 train/val/test split。
+    parser.add_argument("--train_dataset", default="ftw_dataset")
+    parser.add_argument("--val_datasets", nargs="+", default=["ftw_dataset"])
+    parser.add_argument("--test_datasets", nargs="+", default=["ftw_dataset"])
+    parser.add_argument("--batch_size", default=4, type=int)
     # Windows 或快速调试时建议先用 0；Linux 训练大数据集时可逐步调高。
     parser.add_argument("--num_workers", default=0, type=int)
     # FTW 数据集默认根目录与国家参数。多个国家时会自动合并到同一个数据集里。
@@ -76,19 +74,25 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--num_samples", default=128, type=int)
     parser.add_argument("--image_size", default=28, type=int)
 
-    # 模型参数：model_name 会被 MInterface 转换为 model/ 下的 nn.Module 类。
-    # 例如 --model_name example_net 会加载 model/example_net.py 中的 ExampleNet。
-    parser.add_argument("--model_name", default="example_net")
-    # 以下参数由示例模型 ExampleNet 使用；新增模型时可继续在这里补充模型超参数。
-    parser.add_argument("--in_channels", default=1, type=int)
+    # 模型参数：默认加载 model/hbg_net.py 中的 HbgNet。
+    parser.add_argument("--model_name", default="hbg_net")
+    parser.add_argument("--in_channels", default=3, type=int)
     parser.add_argument("--hidden_dim", default=64, type=int)
-    parser.add_argument("--num_classes", default=10, type=int)
+    parser.add_argument("--num_classes", default=2, type=int)
+    parser.add_argument("--img_size", default=512, type=int)
+    parser.add_argument("--drop_rate", default=0.4, type=float)
+    parser.add_argument("--pretrained_path", default=None)
+    parser.add_argument("--return_aux_outputs", nargs="?", const=True, default=True, type=str_to_bool)
 
     # 优化器、损失和指标参数：由 MInterface 统一解释并创建对应对象。
     # 如果需要新增 loss/metric/optimizer，请同步扩展 model/model_interface.py。
-    parser.add_argument("--loss", choices=["cross_entropy", "mse", "triplet_margin_loss"], default="cross_entropy")
-    parser.add_argument("--metric", choices=["accuracy", "recall"], default="accuracy")
-    parser.add_argument("--optimizer", choices=["sgd", "adam", "adamw"], default="adam")
+    parser.add_argument(
+        "--loss",
+        choices=["cross_entropy", "mse", "triplet_margin_loss", "bce_with_logits", "loss_f"],
+        default="loss_f",
+    )
+    parser.add_argument("--metric", choices=["accuracy", "recall", "none"], default="none")
+    parser.add_argument("--optimizer", choices=["sgd", "adam", "adamw"], default="adamw")
     parser.add_argument("--lr", default=1e-3, type=float)
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--weight_decay", default=1e-5, type=float)
@@ -107,13 +111,12 @@ def build_callbacks(args):
     - ModelCheckpoint：按验证指标保存最优模型和 last checkpoint；
     - LearningRateMonitor：仅在启用学习率调度器时记录学习率变化。
     """
+    monitor = "val_loss/dataloader_idx_0" if args.metric == "none" else f"val_{args.metric}/dataloader_idx_0"
     callbacks = [
         ModelSummary(max_depth=2),
         ModelCheckpoint(
-            # 当有多个验证集时，Lightning 会给指标名追加 /dataloader_idx_N。
-            # 默认监控第一个验证集的 accuracy；如果换成 recall，请同步改成 val_recall/dataloader_idx_0。
-            monitor="val_accuracy/dataloader_idx_0",
-            mode="max",
+            monitor=monitor,
+            mode="min" if args.metric == "none" else "max",
             save_top_k=1,
             save_last=True,
             filename="best-{epoch:02d}",

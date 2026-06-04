@@ -17,6 +17,7 @@ dependencies = [
     "fastparquet>=2026.5.0",
     "matplotlib>=3.10.9",
     "scikit-image>=0.26.0",
+    "timm>=1.0.27",
 ]
 
 [project.optional-dependencies]

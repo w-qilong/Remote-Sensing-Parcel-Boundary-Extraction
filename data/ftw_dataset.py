@@ -18,7 +18,6 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-import matplotlib.pyplot as plt
 
 
 def read_tif(file_name, xoff=0, yoff=0, data_width=0, data_height=0):
@@ -136,6 +135,19 @@ def _as_list(value: str | Sequence[str]) -> list[str]:
     return list(value)
 
 
+def _resolve_data_root(data_root: str) -> Path:
+    path = Path(data_root)
+    if path.is_absolute() or path.exists():
+        return path
+
+    project_root = Path(__file__).resolve().parents[1]
+    project_relative = project_root / path
+    if project_relative.exists():
+        return project_relative
+
+    return path
+
+
 class FtwDataset(Dataset):
     """FTW 训练/验证/测试数据集。
 
@@ -151,7 +163,7 @@ class FtwDataset(Dataset):
         file_names: list[str] | None = None,
     ) -> None:
         # 根目录保存为 Path，后续拼接子目录时更清晰，也更不容易写错斜杠。
-        self.data_root = Path(data_root)
+        self.data_root = _resolve_data_root(data_root)
         # country 参数既支持单个字符串，也支持字符串列表；统一转成列表后再处理。
         self.countries = _as_list(country)
         self.split = split
