@@ -77,6 +77,22 @@ def test_ftw_dataset_merges_multiple_countries(tmp_path):
     assert second_name == "rwanda/same_name"
 
 
+def test_ftw_dataset_all_discovers_available_countries(tmp_path):
+    """country=all 时，应扫描 data_root 下所有有当前 split 的国家。"""
+    from data.ftw_dataset import FtwDataset
+
+    ftw_root = tmp_path / "ftw_dataset"
+    _build_ftw_split(ftw_root, "kenya", "train", sample_name="kenya_sample")
+    _build_ftw_split(ftw_root, "rwanda", "train", sample_name="rwanda_sample")
+    _build_ftw_split(ftw_root, "france", "val", sample_name="val_only")
+
+    dataset = FtwDataset(data_root=str(ftw_root), country="all", split="train")
+
+    assert len(dataset) == 2
+    assert dataset.countries == ["kenya", "rwanda"]
+    assert dataset.file_names == ["kenya/kenya_sample", "rwanda/rwanda_sample"]
+
+
 def test_ftw_dataset_resolves_relative_root_from_project_root(tmp_path, monkeypatch):
     """FtwDataset should still find project data when launched from another cwd."""
     from data import ftw_dataset
@@ -169,6 +185,33 @@ def test_data_interface_merges_multiple_countries(tmp_path):
     second_name, *_ = dm.train_set[1]
     assert first_name == "kenya/shared_sample"
     assert second_name == "rwanda/shared_sample"
+
+
+def test_data_interface_all_countries(tmp_path):
+    """DInterface 传入 all 时，应把所有已下载国家合并为同一个训练集。"""
+    from data import DInterface
+
+    ftw_root = tmp_path / "ftw_dataset"
+    _build_ftw_split(ftw_root, "kenya", "train", sample_name="kenya_train")
+    _build_ftw_split(ftw_root, "rwanda", "train", sample_name="rwanda_train")
+    _build_ftw_split(ftw_root, "kenya", "val", sample_name="kenya_val")
+    _build_ftw_split(ftw_root, "rwanda", "val", sample_name="rwanda_val")
+
+    dm = DInterface(
+        train_dataset="ftw_dataset",
+        val_datasets=["ftw_dataset"],
+        test_datasets=["ftw_dataset"],
+        data_root=str(ftw_root),
+        country=["all"],
+        batch_size=1,
+        num_workers=0,
+    )
+
+    dm.setup("fit")
+
+    assert dm.train_set.countries == ["kenya", "rwanda"]
+    assert dm.train_set.file_names == ["kenya/kenya_train", "rwanda/rwanda_train"]
+    assert dm.val_sets[0].file_names == ["kenya/kenya_val", "rwanda/rwanda_val"]
 
 
 def test_data_interface_builds_fake_data_loaders(tmp_path):

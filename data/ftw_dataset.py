@@ -19,6 +19,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+ALL_COUNTRIES = "all"
+
 
 def read_tif(file_name, xoff=0, yoff=0, data_width=0, data_height=0):
     """读取 TIFF 文件，并返回基础元数据和像素数据。
@@ -135,6 +137,41 @@ def _as_list(value: str | Sequence[str]) -> list[str]:
     return list(value)
 
 
+def _discover_countries(data_root: Path, split: str) -> list[str]:
+    """发现当前数据根目录下拥有指定 split 影像的全部国家。"""
+
+    countries: list[str] = []
+    if not data_root.exists():
+        raise FileNotFoundError(f"FTW data root not found: {data_root}")
+
+    for country_dir in sorted(path for path in data_root.iterdir() if path.is_dir()):
+        image_dir = country_dir / split / "image"
+        if image_dir.exists() and any(image_dir.glob("*.tif")):
+            countries.append(country_dir.name)
+
+    if not countries:
+        raise FileNotFoundError(
+            f"No FTW countries with split '{split}' were found under {data_root}"
+        )
+    return countries
+
+
+def _resolve_countries(country: str | Sequence[str], data_root: Path, split: str) -> list[str]:
+    """解析单国家、多国家或 all 国家选择。"""
+
+    countries = _as_list(country)
+    normalized = [country_name.strip() for country_name in countries if country_name.strip()]
+    if not normalized:
+        raise ValueError("At least one FTW country must be provided.")
+
+    if any(country_name.lower() == ALL_COUNTRIES for country_name in normalized):
+        if len(normalized) > 1:
+            raise ValueError("Use either 'all' or explicit countries, not both.")
+        return _discover_countries(data_root, split)
+
+    return normalized
+
+
 def _resolve_data_root(data_root: str) -> Path:
     path = Path(data_root)
     if path.is_absolute() or path.exists():
@@ -164,9 +201,9 @@ class FtwDataset(Dataset):
     ) -> None:
         # 根目录保存为 Path，后续拼接子目录时更清晰，也更不容易写错斜杠。
         self.data_root = _resolve_data_root(data_root)
-        # country 参数既支持单个字符串，也支持字符串列表；统一转成列表后再处理。
-        self.countries = _as_list(country)
         self.split = split
+        # country 参数既支持单个字符串、字符串列表，也支持 "all" 自动扫描全部国家。
+        self.countries = _resolve_countries(country, self.data_root, self.split)
         # 当 country 多于一个时，我们把多个国家的数据拼接成一个长数据集。
         self.multiple_countries = len(self.countries) > 1
         # samples 里保存的是 (country_name, image_name) 二元组，避免不同国家之间重名冲突。

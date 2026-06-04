@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import argparse
 import os
 import shutil
 import urllib.request
@@ -20,6 +21,7 @@ from typing import Callable
 import numpy as np
 
 FTW_ARCHIVE_BASE_URL = "https://data.source.coop/kerner-lab/fields-of-the-world-archive"
+ALL_COUNTRIES = "all"
 
 FTW_CONFIG_DEFAULTS = {
     "download_root": Path("ftw_data") / "ftw_origin_data",
@@ -32,6 +34,7 @@ FTW_CONFIG_DEFAULTS = {
     "reflectance_max": 3000.0,
     "boundary_kernel_size": 3,
     "clean_download": False,
+    "download_only": False,
 }
 
 
@@ -74,6 +77,32 @@ def _parse_countries(countries: str | list[str] | tuple[str, ...]) -> list[str]:
     return parsed
 
 
+def _resolve_requested_countries(
+    countries: str | list[str] | tuple[str, ...],
+    available_countries: list[str] | tuple[str, ...],
+) -> list[str]:
+    """Resolve explicit country names or the special 'all' value."""
+
+    requested = _parse_countries(countries)
+    available = [country.lower() for country in available_countries]
+    available_set = set(available)
+
+    if ALL_COUNTRIES in requested:
+        if len(requested) > 1:
+            raise ValueError("Use either 'all' or explicit countries, not both.")
+        if not available:
+            raise ValueError("No FTW countries are available to resolve 'all'.")
+        return available
+
+    unknown = [country for country in requested if country not in available_set]
+    if unknown:
+        raise ValueError(
+            "Unknown FTW country/countries: "
+            f"{', '.join(unknown)}. Available countries: {', '.join(available)}"
+        )
+    return requested
+
+
 def normalize_config(config: dict) -> dict:
     """规范化国家列表和 split 列表，便于后续循环处理。"""
 
@@ -90,6 +119,21 @@ def normalize_config(config: dict) -> dict:
     else:
         config["splits"] = [split.strip() for split in config["splits"] if split.strip()]
     return config
+
+
+def _discover_countries_from_ftw_root(ftw_root: Path) -> list[str]:
+    """Discover countries from an already-unpacked FTW directory."""
+
+    countries: set[str] = set()
+    for chips_path in ftw_root.glob("chips_*.parquet"):
+        countries.add(chips_path.stem.removeprefix("chips_").lower())
+    for country_root in ftw_root.iterdir() if ftw_root.exists() else []:
+        if not country_root.is_dir():
+            continue
+        country = country_root.name.lower()
+        if (country_root / f"chips_{country}.parquet").exists():
+            countries.add(country)
+    return sorted(countries)
 
 
 def _load_checksums(path: Path) -> dict[str, str]:
@@ -157,10 +201,12 @@ def download_ftw_dataset(
     if not checksum_path.exists():
         urlretrieve_fn(f"{base_url}/checksum.md5", checksum_path)
     checksums = _load_checksums(checksum_path)
+    selected_countries = _resolve_requested_countries(countries, list(checksums))
 
     results: dict[str, Path] = {}
     ftw_root = out_dir / "ftw"
-    for country in _parse_countries(countries):
+    for country in selected_countries:
+        print(f"Processing country: {country}")
         zip_path = out_dir / f"{country}.zip"
         # zip 文件按国家命名，缺失时才下载；这样断点重跑时可以直接复用已有文件。
         if not zip_path.exists():
@@ -374,16 +420,26 @@ def main(config: dict | None = None) -> None:
     config = normalize_config(config or FTW_CONFIG_DEFAULTS)
     if config["ftw_root"]:
         ftw_root = Path(config["ftw_root"])
+        if ALL_COUNTRIES in config["countries"]:
+            config["countries"] = _resolve_requested_countries(
+                config["countries"], _discover_countries_from_ftw_root(ftw_root)
+            )
     else:
         # 如果没有提供原始数据目录，就先下载并解压，再进入预处理阶段。
-        download_ftw_dataset(
+        downloaded = download_ftw_dataset(
             out_dir=config["download_root"],
             countries=config["countries"],
             clean_download=config["clean_download"],
             unpack=True,
         )
+        config["countries"] = list(downloaded)
         ftw_root = Path(config["download_root"]) / "ftw"
 
+    if config.get("download_only"):
+        print(f"Downloaded countries: {', '.join(config['countries'])}")
+        return
+
+    _bootstrap_local_venv_if_needed()
     stats = convert_ftw_to_hbgnet(
         ftw_root=ftw_root,
         output_root=config["output_root"],
@@ -397,7 +453,54 @@ def main(config: dict | None = None) -> None:
     print(f"Converted samples: {stats}")
 
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Download and preprocess Fields of The World data."
+    )
+    parser.add_argument(
+        "--countries",
+        help="Comma-separated country names, or 'all' to download all countries.",
+    )
+    parser.add_argument("--download-root", type=Path, help="Directory for FTW zip files.")
+    parser.add_argument("--ftw-root", type=Path, help="Existing unpacked FTW root.")
+    parser.add_argument("--output-root", type=Path, help="Output directory for HBGNet data.")
+    parser.add_argument("--splits", help="Comma-separated splits, for example train,val,test.")
+    parser.add_argument("--max-samples-per-split", type=int)
+    parser.add_argument("--image-window", help="FTW image window folder, for example window_b.")
+    parser.add_argument("--reflectance-max", type=float)
+    parser.add_argument("--boundary-kernel-size", type=int)
+    parser.add_argument("--clean-download", action="store_true")
+    parser.add_argument(
+        "--download-only",
+        action="store_true",
+        help="Only download and unpack FTW archives; skip preprocessing.",
+    )
+    return parser
+
+
+def _config_from_args(argv: list[str] | None = None) -> dict:
+    args = _build_arg_parser().parse_args(argv)
+    config = deepcopy(FTW_CONFIG_DEFAULTS)
+    for key in (
+        "countries",
+        "download_root",
+        "ftw_root",
+        "output_root",
+        "splits",
+        "max_samples_per_split",
+        "image_window",
+        "reflectance_max",
+        "boundary_kernel_size",
+    ):
+        value = getattr(args, key)
+        if value is not None:
+            config[key] = value
+    if args.clean_download:
+        config["clean_download"] = True
+    if args.download_only:
+        config["download_only"] = True
+    return config
+
+
 if __name__ == "__main__":
-    # 先确保当前运行环境具备 rasterio，再执行主流程。
-    _bootstrap_local_venv_if_needed()
-    main()
+    main(_config_from_args())

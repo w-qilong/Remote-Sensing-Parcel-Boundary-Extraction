@@ -34,3 +34,16 @@ def test_parser_exposes_ftw_defaults():
     assert args.loss == "loss_f"
     assert args.metric == "none"
     assert args.return_aux_outputs is True
+
+
+def test_parser_accepts_all_and_arbitrary_ftw_countries():
+    """训练入口不应把 FTW 国家限制在 kenya/rwanda。"""
+    from main import build_parser
+
+    parser = build_parser()
+
+    assert parser.parse_args(["--country", "all"]).country == ["all"]
+    assert parser.parse_args(["--country", "germany", "france"]).country == [
+        "germany",
+        "france",
+    ]

@@ -69,7 +69,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--num_workers", default=0, type=int)
     # FTW 数据集默认根目录与国家参数。多个国家时会自动合并到同一个数据集里。
     parser.add_argument("--data_root", default="ftw_data/ftw_dataset")
-    parser.add_argument("--country", nargs="+", choices=["kenya", "rwanda"], default=["kenya"])
+    parser.add_argument("--country", nargs="+", default=["all"]) # 设置为all时会自动选择所有国家的数据。也可以使用 --country ['<country1>', '<country2>']来指定多个国家。
     # 以下参数由示例数据集 ExampleData 使用；换成真实数据集后可替换为 data_dir 等参数。
     parser.add_argument("--num_samples", default=128, type=int)
     parser.add_argument("--image_size", default=28, type=int)
