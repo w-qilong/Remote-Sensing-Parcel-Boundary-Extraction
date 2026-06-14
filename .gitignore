@@ -12,6 +12,7 @@ venv/
 
 logs/
 Logs/
+predictions/
 checkpoints/
 *.ckpt
 
