@@ -9,11 +9,11 @@ import numpy as np
 import rasterio
 from skimage.color import label2rgb
 
-window_a_file = r"ftw_data\ftw_dataset\rwanda\train\image\1592589.tif"
-window_b_file = r"ftw_data\ftw_origin_data\ftw\kenya\s2_images\window_b\g0_0000000000-0000008192.tif"
-semantic_2_class_file = r"ftw_data\ftw_dataset\rwanda\train\mask\1592589.tif"
-semantic_3_class_file = r"ftw_data\ftw_dataset\rwanda\train\boundary\1592589.tif"
-instance_class_file = r"ftw_data\ftw_origin_data\ftw\kenya\label_masks\instance\g0_0000000000-0000008192.tif"
+window_a_file = r"ftw_data/ftw_dataset/rwanda/train/image/1592589.tif"
+window_b_file = r"ftw_data/ftw_origin_data/ftw/kenya/s2_images/window_b/g0_0000000000-0000008192.tif"
+semantic_2_class_file = r"ftw_data/ftw_dataset/rwanda/train/mask/1592589.tif"
+semantic_3_class_file = r"ftw_data/ftw_dataset/rwanda/train/boundary/1592589.tif"
+instance_class_file = r"ftw_data/ftw_origin_data/ftw/kenya/label_masks/instance/g0_0000000000-0000008192.tif"
 
 
 def plot_data(window_a_file, window_b_file, semantic_2_class_file, semantic_3_class_file, instance_class_file):

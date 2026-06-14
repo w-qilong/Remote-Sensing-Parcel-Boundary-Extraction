@@ -42,6 +42,7 @@ class MInterface(L.LightningModule):
         lr_decay_steps: int = 10,
         lr_decay_rate: float = 0.5,
         lr_decay_min_lr: float = 1e-5,
+        max_epochs: int = 30,
         num_classes: int = 10,
         **kwargs,
     ) -> None:
@@ -279,13 +280,23 @@ class MInterface(L.LightningModule):
                 step_size=self.hparams.lr_decay_steps,
                 gamma=self.hparams.lr_decay_rate,
             )
+            interval = "epoch"
         elif scheduler_name == "cosine":
             scheduler = schedulers.CosineAnnealingLR(
                 optimizer,
-                T_max=self.hparams.lr_decay_steps,
+                T_max=max(1, self.hparams.max_epochs),
                 eta_min=self.hparams.lr_decay_min_lr,
             )
+            interval = "epoch"
         else:
             raise ValueError(f"未支持的学习率调度器: {scheduler_name}")
         # 返回字典可以让 Lightning 清楚识别 optimizer 与 lr_scheduler 的关系。
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": interval,
+                "frequency": 1,
+                "name": scheduler_name,
+            },
+        }

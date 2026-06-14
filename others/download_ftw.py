@@ -27,7 +27,8 @@ FTW_CONFIG_DEFAULTS = {
     "download_root": Path("ftw_data") / "ftw_origin_data",
     "ftw_root": None,
     "output_root": Path("ftw_data") / "ftw_dataset",
-    "countries": ["rwanda",'kenya'], # 修改此处以包含更多国家，例如 ["rwanda", "malawi", "nigeria"]
+    # "countries": ["spain",'france'], # 修改此处以包含更多国家，例如 ["rwanda", "malawi", "nigeria"]
+    "countries": 'all',
     "splits": "train,val,test",
     "max_samples_per_split": None,
     "image_window": "window_b",
@@ -458,7 +459,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Download and preprocess Fields of The World data."
     )
     parser.add_argument(
-        "--countries",
+        "--countries",default='all',
         help="Comma-separated country names, or 'all' to download all countries.",
     )
     parser.add_argument("--download-root", type=Path, help="Directory for FTW zip files.")

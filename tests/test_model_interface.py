@@ -39,6 +39,37 @@ def test_model_interface_runs_training_step_and_optimizer():
     assert isinstance(optimizer, torch.optim.Adam)
 
 
+def test_model_interface_configures_cosine_lr_scheduler():
+    """cosine 学习率应交给 Lightning 按 epoch 动态调度。"""
+    from model import MInterface
+
+    module = MInterface(
+        model_name="example_net",
+        loss="cross_entropy",
+        metric="accuracy",
+        optimizer="adamw",
+        lr=1e-3,
+        weight_decay=0.0,
+        lr_scheduler="cosine",
+        lr_decay_min_lr=1e-5,
+        max_epochs=7,
+        num_classes=10,
+        in_channels=1,
+    )
+
+    config = module.configure_optimizers()
+    scheduler_config = config["lr_scheduler"]
+    scheduler = scheduler_config["scheduler"]
+
+    assert isinstance(config["optimizer"], torch.optim.AdamW)
+    assert isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR)
+    assert scheduler.T_max == 7
+    assert scheduler.eta_min == 1e-5
+    assert scheduler_config["interval"] == "epoch"
+    assert scheduler_config["frequency"] == 1
+    assert scheduler_config["name"] == "cosine"
+
+
 def test_model_interface_runs_loss_f_training_step(monkeypatch):
     """MInterface 应能用 LossF 跑通 FTW/HBGNet 风格的多任务 batch。"""
     from model import MInterface
