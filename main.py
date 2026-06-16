@@ -59,7 +59,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--max_epochs", default=30, type=int)
     parser.add_argument("--early_stopping_patience", default=3, type=int)
     # 32-true 是最稳妥的全精度训练；需要混合精度时可改成 16-mixed 或 bf16-mixed。
-    parser.add_argument("--precision", default="16-mixed")
+    parser.add_argument("--precision", default="32-true")
     # fast_dev_run 会只跑极少 batch，适合检查数据、模型、loss、日志是否能串起来。
     parser.add_argument("--fast_dev_run", nargs="?", const=True, default=False, type=str_to_bool) # TDOD: 调试时设置为 true，正式训练时设置为 false。
     # TensorBoard 日志会写入 log_dir/experiment_name。
@@ -100,10 +100,10 @@ def build_parser() -> ArgumentParser:
     )
     parser.add_argument("--metric", choices=["accuracy", "recall", "none"], default="none")
     parser.add_argument("--optimizer", choices=["sgd", "adam", "adamw"], default="adamw")
-    parser.add_argument("--lr", default=1e-3, type=float)
+    parser.add_argument("--lr", default=1e-4, type=float)
     parser.add_argument("--momentum", default=0.9, type=float)
     parser.add_argument("--weight_decay", default=1e-5, type=float)
-    parser.add_argument("--lr_scheduler", choices=["none", "step", "cosine"], default="cosine")
+    parser.add_argument("--lr_scheduler", choices=["none", "step", "cosine"], default="none")
     parser.add_argument("--lr_decay_steps", default=10, type=int)
     parser.add_argument("--lr_decay_rate", default=0.5, type=float)
     parser.add_argument("--lr_decay_min_lr", default=1e-5, type=float)

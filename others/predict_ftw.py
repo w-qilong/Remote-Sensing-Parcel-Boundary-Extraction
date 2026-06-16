@@ -1,8 +1,8 @@
 """Run FTW test-set prediction and save visual comparison images.
 
 Each saved PNG contains two rows:
-1. original RGB image, predicted mask, predicted boundary, predicted distance
-2. original RGB image, target mask, target boundary, target distance
+1. original RGB image, predicted mask, predicted boundary, boundary probability, predicted distance
+2. original RGB image, target mask, target boundary, target boundary reference, target distance
 """
 
 from __future__ import annotations
@@ -34,15 +34,21 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 # checkpoint 是唯一必填项：它应指向训练过程中 ModelCheckpoint 保存的 .ckpt 文件。
 # country 支持单国家、多国家或 "all"，规则与 FtwDataset 保持一致。
 PREDICT_CONFIG_DEFAULTS = {
-    "checkpoint": 'logs/hbg_net_ftw/version_0/checkpoints/best-07.ckpt',
+    "checkpoint": 'logs/hbg_net_ftw/version_2/checkpoints/best-24.ckpt',
     "data_root": "ftw_data/ftw_dataset",
     "country": ["austria"],
     "split": "test",
     "output_dir": Path("predictions") / "ftw_test",
     "batch_size": 1,
     "num_workers": 0,
-    "max_samples": None,
-    "mask_threshold": 0.5,
+    "max_samples": 40, # None 表示保存整个 split；调试时可设置为较小值快速查看结果。
+    "mask_threshold": 0.9,
+    "boundary_threshold": 0.2,
+    "boundary_postprocess": True,
+    "boundary_close_kernel_size": 3,
+    "boundary_close_iterations": 1,
+    "boundary_dilate_kernel_size": 3,
+    "boundary_dilate_iterations": 0,
     "device": "auto",
     "return_aux_outputs": True,
 }
@@ -95,24 +101,80 @@ def mask_from_logits(mask_logits: torch.Tensor, threshold: float) -> torch.Tenso
     return mask_logits.softmax(dim=1).argmax(dim=1, keepdim=True) > 0
 
 
-def boundary_from_output_or_mask(output, predicted_mask: torch.Tensor) -> torch.Tensor:
-    """Use model boundary output when available, otherwise derive edges from mask."""
+def boundary_from_mask(predicted_mask: torch.Tensor) -> torch.Tensor:
+    """Derive a binary boundary from a predicted mask."""
 
-    # HBGNet return_aux_outputs=True 时输出 [mask_logits, edge_log_probs, distance_map]。
-    # edge_log_probs 是边界分支的二分类 log-prob/score，因此优先使用该分支。
-    if isinstance(output, (list, tuple)) and len(output) > 1:
-        edge_logits = output[1]
-        if edge_logits.ndim == 4 and edge_logits.size(1) > 1:
-            return edge_logits.argmax(dim=1, keepdim=True) > 0
-        if edge_logits.ndim == 4 and edge_logits.size(1) == 1:
-            return torch.sigmoid(edge_logits) > 0.5
-
-    # 如果模型没有边界输出，就从预测 mask 里临时提取边界。
     # 这里用 max-pool 实现近似的膨胀/腐蚀差值，得到形态学梯度。
     mask = predicted_mask.float()
     eroded = -F.max_pool2d(-mask, kernel_size=3, stride=1, padding=1)
     dilated = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
     return (dilated - eroded) > 0
+
+
+def boundary_probability_from_output_or_mask(output, predicted_mask: torch.Tensor) -> torch.Tensor:
+    """Return a continuous boundary probability map for visualization."""
+
+    if isinstance(output, (list, tuple)) and len(output) > 1:
+        edge_scores = output[1]
+        if edge_scores.ndim == 4 and edge_scores.size(1) > 1:
+            return edge_scores.softmax(dim=1)[:, 1:2]
+        if edge_scores.ndim == 4 and edge_scores.size(1) == 1:
+            return torch.sigmoid(edge_scores)
+
+    # 如果模型没有边界输出，就从预测 mask 里临时提取边界作为 0/1 概率图兜底。
+    return boundary_from_mask(predicted_mask).float()
+
+
+def boundary_from_output_or_mask(
+    output,
+    predicted_mask: torch.Tensor,
+    threshold: float = 0.5,
+) -> torch.Tensor:
+    """Use boundary-class probability when available, otherwise derive edges from mask."""
+
+    return boundary_probability_from_output_or_mask(output, predicted_mask) > threshold
+
+
+def _ensure_odd_kernel_size(kernel_size: int, name: str) -> int:
+    """Validate a morphology kernel size."""
+
+    if kernel_size < 1 or kernel_size % 2 == 0:
+        raise ValueError(f"{name} must be a positive odd integer, got {kernel_size}.")
+    return kernel_size
+
+
+def _morph_dilate(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    kernel_size = _ensure_odd_kernel_size(kernel_size, "kernel_size")
+    padding = kernel_size // 2
+    return F.max_pool2d(mask.float(), kernel_size=kernel_size, stride=1, padding=padding) > 0
+
+
+def _morph_erode(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    kernel_size = _ensure_odd_kernel_size(kernel_size, "kernel_size")
+    padding = kernel_size // 2
+    return (-F.max_pool2d(-mask.float(), kernel_size=kernel_size, stride=1, padding=padding)) > 0.5
+
+
+def postprocess_boundary(
+    boundary: torch.Tensor,
+    close_kernel_size: int = 3,
+    close_iterations: int = 1,
+    dilate_kernel_size: int = 3,
+    dilate_iterations: int = 0,
+) -> torch.Tensor:
+    """Lightly postprocess a binary boundary with closing and optional dilation."""
+
+    if close_iterations < 0:
+        raise ValueError(f"close_iterations must be non-negative, got {close_iterations}.")
+    if dilate_iterations < 0:
+        raise ValueError(f"dilate_iterations must be non-negative, got {dilate_iterations}.")
+
+    processed = boundary.bool()
+    for _ in range(close_iterations):
+        processed = _morph_erode(_morph_dilate(processed, close_kernel_size), close_kernel_size)
+    for _ in range(dilate_iterations):
+        processed = _morph_dilate(processed, dilate_kernel_size)
+    return processed
 
 
 def binary_tensor_to_image(mask: torch.Tensor) -> np.ndarray:
@@ -164,6 +226,15 @@ def distance_from_output(output, predicted_mask: torch.Tensor) -> torch.Tensor:
     return torch.zeros_like(predicted_mask, dtype=torch.float32)
 
 
+def _panel_from_grayscale(array: np.ndarray, target_size: tuple[int, int]) -> Image.Image:
+    """Convert a grayscale array to an RGB panel aligned with the source image."""
+
+    panel = Image.fromarray(array, mode="L").convert("RGB")
+    if panel.size != target_size:
+        panel = panel.resize(target_size, Image.Resampling.NEAREST)
+    return panel
+
+
 def make_visualization(
     rgb: np.ndarray,
     predicted_mask: np.ndarray,
@@ -172,47 +243,52 @@ def make_visualization(
     target_mask: np.ndarray,
     target_boundary: np.ndarray,
     target_distance: np.ndarray,
+    predicted_boundary_probability: np.ndarray | None = None,
+    image_title: str = "image",
 ) -> Image.Image:
     """Create a two-row prediction/target visualization."""
 
     # PIL 的拼接都使用 RGB 模式。mask/boundary/distance 本质是单通道灰度，
-    # 先转 RGB 可以让它们和原图在同一张 canvas 上无缝粘贴。
+    # 先转 RGB 并按原图尺寸对齐，可以避免 target panel 和 image 静默错位。
     rgb_image = Image.fromarray(rgb, mode="RGB")
-    predicted_mask_image = Image.fromarray(predicted_mask, mode="L").convert("RGB")
-    predicted_boundary_image = Image.fromarray(predicted_boundary, mode="L").convert("RGB")
-    predicted_distance_image = Image.fromarray(predicted_distance, mode="L").convert("RGB")
-    target_mask_image = Image.fromarray(target_mask, mode="L").convert("RGB")
-    target_boundary_image = Image.fromarray(target_boundary, mode="L").convert("RGB")
-    target_distance_image = Image.fromarray(target_distance, mode="L").convert("RGB")
-
     width, height = rgb_image.size
+    target_size = (width, height)
+    predicted_mask_image = _panel_from_grayscale(predicted_mask, target_size)
+    predicted_boundary_image = _panel_from_grayscale(predicted_boundary, target_size)
+    predicted_boundary_probability_image = (
+        _panel_from_grayscale(predicted_boundary_probability, target_size)
+        if predicted_boundary_probability is not None
+        else None
+    )
+    predicted_distance_image = _panel_from_grayscale(predicted_distance, target_size)
+    target_mask_image = _panel_from_grayscale(target_mask, target_size)
+    target_boundary_image = _panel_from_grayscale(target_boundary, target_size)
+    target_distance_image = _panel_from_grayscale(target_distance, target_size)
+
     label_height = 28
     # 第一行是模型预测，第二行是真实标签；列顺序保持一致，便于上下对比。
-    panels = [
-        [
-            ("image", rgb_image),
-            ("pred_mask", predicted_mask_image),
-            ("pred_boundary", predicted_boundary_image),
-            ("pred_distance", predicted_distance_image),
-        ],
-        [
-            ("image", rgb_image),
-            ("target_mask", target_mask_image),
-            ("target_boundary", target_boundary_image),
-            ("target_distance", target_distance_image),
-        ],
+    prediction_row = [
+        (image_title, rgb_image),
+        ("pred_mask", predicted_mask_image),
+        ("pred_boundary", predicted_boundary_image),
+    ]
+    target_row = [
+        (image_title, rgb_image),
+        ("target_mask", target_mask_image),
+        ("target_boundary", target_boundary_image),
     ]
 
-    # 模型输出尺寸理论上应与输入一致，但如果未来模型改了上采样策略，
-    # 这里会把标签/预测图拉回原图尺寸，避免拼图时报错或尺寸错位。
-    for row in panels:
-        for index, (label, panel) in enumerate(row):
-            if index > 0 and panel.size != rgb_image.size:
-                row[index] = (label, panel.resize((width, height), Image.Resampling.NEAREST))
+    if predicted_boundary_probability_image is not None:
+        prediction_row.append(("pred_boundary_prob", predicted_boundary_probability_image))
+        target_row.append(("target_boundary_ref", target_boundary_image))
+
+    prediction_row.append(("pred_distance", predicted_distance_image))
+    target_row.append(("target_distance", target_distance_image))
+    panels = [prediction_row, target_row]
 
     # 每个 panel 顶部预留 label_height 用于写标题，主体图像仍保持原始宽高。
     row_height = height + label_height
-    canvas = Image.new("RGB", (width * 4, row_height * 2), "white")
+    canvas = Image.new("RGB", (width * len(panels[0]), row_height * 2), "white")
     draw = ImageDraw.Draw(canvas)
 
     for row_index, row in enumerate(panels):
@@ -274,7 +350,23 @@ def predict(config: dict | None = None) -> None:
             # output 既可能是 HBGNet 的三输出列表，也可能是普通单输出张量。
             mask_logits = output[0] if isinstance(output, (list, tuple)) else output
             predicted_masks = mask_from_logits(mask_logits, config["mask_threshold"])
-            predicted_boundaries = boundary_from_output_or_mask(output, predicted_masks)
+            predicted_boundaries = boundary_from_output_or_mask(
+                output,
+                predicted_masks,
+                threshold=config["boundary_threshold"],
+            )
+            if config["boundary_postprocess"]:
+                predicted_boundaries = postprocess_boundary(
+                    predicted_boundaries,
+                    close_kernel_size=config["boundary_close_kernel_size"],
+                    close_iterations=config["boundary_close_iterations"],
+                    dilate_kernel_size=config["boundary_dilate_kernel_size"],
+                    dilate_iterations=config["boundary_dilate_iterations"],
+                )
+            predicted_boundary_probabilities = boundary_probability_from_output_or_mask(
+                output,
+                predicted_masks,
+            )
             predicted_distances = distance_from_output(output, predicted_masks)
 
             for item_index, name in enumerate(names):
@@ -282,6 +374,9 @@ def predict(config: dict | None = None) -> None:
                 rgb = tensor_to_rgb_image(images[item_index])
                 predicted_mask = binary_tensor_to_image(predicted_masks[item_index])
                 predicted_boundary = binary_tensor_to_image(predicted_boundaries[item_index])
+                predicted_boundary_probability = continuous_tensor_to_image(
+                    predicted_boundary_probabilities[item_index],
+                )
                 predicted_distance = continuous_tensor_to_image(
                     predicted_distances[item_index],
                     normalize=True,
@@ -297,6 +392,8 @@ def predict(config: dict | None = None) -> None:
                     target_mask,
                     target_boundary,
                     target_distance,
+                    predicted_boundary_probability=predicted_boundary_probability,
+                    image_title=name,
                 )
                 output_path = output_dir / f"{_safe_name(name)}.png"
                 visualization.save(output_path)
