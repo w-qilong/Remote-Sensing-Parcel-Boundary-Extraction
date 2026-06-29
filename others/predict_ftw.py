@@ -42,9 +42,9 @@ PREDICT_CONFIG_DEFAULTS = {
     "batch_size": 1,
     "num_workers": 0,
     "max_samples": 40, # None 表示保存整个 split；调试时可设置为较小值快速查看结果。
-    "mask_threshold": 0.9,
-    "boundary_threshold": 0.2,
-    "boundary_postprocess": True,
+    "mask_threshold": 0.75,
+    "boundary_threshold": 0.5,
+    "boundary_postprocess": False,
     "boundary_close_kernel_size": 3,
     "boundary_close_iterations": 1,
     "boundary_dilate_kernel_size": 3,
