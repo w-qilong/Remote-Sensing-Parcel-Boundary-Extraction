@@ -16,6 +16,7 @@ import inspect
 from collections.abc import Sequence
 
 import lightning as L
+from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from torch.utils.data import DataLoader
 
 
@@ -96,8 +97,57 @@ class DInterface(L.LightningDataModule):
         }
         merged_kwargs = dict(self.kwargs)
         merged_kwargs.update(override_kwargs)
-        dataset_kwargs = {name: merged_kwargs[name] for name in accepted if name in merged_kwargs}
+        # 只传入 Dataset 真正声明且值不为 None 的参数。
+        # 这样命令行参数写成 default=None 时，不会覆盖 Dataset.__init__ 里的默认值。
+        # 例如 FBIS-22M 的 data_root 默认是 datasets/FBIS-22M；若把 None 传进去，
+        # pathlib.Path(None) 会直接报 TypeError。
+        dataset_kwargs = {
+            name: merged_kwargs[name]
+            for name in accepted
+            if name in merged_kwargs and merged_kwargs[name] is not None
+        }
         return dataset_cls(**dataset_kwargs)
+
+    @staticmethod
+    def _dataset_size(dataset) -> int | str:
+        """安全获取 Dataset 样本数量。
+
+        标准 PyTorch Dataset 都应实现 ``__len__``；这里仍做一层保护，避免自定义
+        IterableDataset 或调试数据集没有长度时直接让日志打印报错。
+        """
+        try:
+            return len(dataset)
+        except TypeError:
+            return "unknown"
+
+    def _log_dataset_sizes(self, stage: str | None) -> None:
+        """打印当前阶段已经创建的数据集样本数量。
+
+        使用 ``rank_zero_info`` 可以保证分布式训练时只在 rank 0 进程打印一次，
+        避免多 GPU 环境下日志重复。
+        """
+        stage_name = "all" if stage is None else stage
+        rank_zero_info(f"[Data] setup(stage={stage_name}) dataset sizes:")
+
+        if hasattr(self, "train_set"):
+            rank_zero_info(
+                f"[Data]   train: {self.train_dataset_name} "
+                f"({self._dataset_size(self.train_set)} samples)"
+            )
+
+        if hasattr(self, "val_sets"):
+            for index, (dataset_name, dataset) in enumerate(zip(self.val_dataset_names, self.val_sets)):
+                rank_zero_info(
+                    f"[Data]   val[{index}]: {dataset_name} "
+                    f"({self._dataset_size(dataset)} samples)"
+                )
+
+        if hasattr(self, "test_sets"):
+            for index, (dataset_name, dataset) in enumerate(zip(self.test_dataset_names, self.test_sets)):
+                rank_zero_info(
+                    f"[Data]   test[{index}]: {dataset_name} "
+                    f"({self._dataset_size(dataset)} samples)"
+                )
 
     def setup(self, stage: str | None = None) -> None:
         """按 Lightning 的阶段创建 Dataset 实例。
@@ -114,6 +164,8 @@ class DInterface(L.LightningDataModule):
         if stage in (None, "test", "predict"):
             self.test_sets = [self._instantiate_dataset(name, split="test") for name in self.test_dataset_names]
 
+        self._log_dataset_sizes(stage)
+
     def _loader(self, dataset, shuffle: bool) -> DataLoader:
         """为任意 Dataset 创建 DataLoader。
 
@@ -121,12 +173,18 @@ class DInterface(L.LightningDataModule):
         可复现并便于定位样本。
         """
         # persistent_workers 只能在 num_workers > 0 时启用，否则 PyTorch 会报错。
+        # 实例分割数据集中每张图的实例数量通常不同；若 Dataset 提供 collate_fn，
+        # 这里自动使用它，避免 PyTorch 默认 collate 尝试 stack 变长标注。
+
+        # 如果 Dataset 提供 collate_fn，DataLoader 会自动使用它
+        collate_fn = getattr(dataset, "collate_fn", None)
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=shuffle,
             num_workers=self.num_workers,
             persistent_workers=self.num_workers > 0,
+            collate_fn=collate_fn if callable(collate_fn) else None,
         )
 
     def train_dataloader(self) -> DataLoader:

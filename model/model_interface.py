@@ -19,7 +19,7 @@ import torch
 from torch import nn
 from torch.optim import lr_scheduler as schedulers
 from torchmetrics.classification import MulticlassAccuracy, MulticlassRecall
-from losses import LossF
+from losses import InstanceLoss, LossF
 
 
 class MInterface(L.LightningModule):
@@ -52,7 +52,7 @@ class MInterface(L.LightningModule):
         # 动态加载真正的业务模型，例如 ExampleNet、ResnetClassifier 等。
         self.model = self._load_model(model_name, kwargs)
         # 根据字符串参数创建损失函数和指标对象，便于命令行切换。
-        self.loss_function = self._build_loss(loss)
+        self.loss_function = self._build_loss(loss, num_classes, kwargs)
         self.metric_name = metric
         # 验证集和测试集使用独立 metric 实例，避免状态互相污染。
         self.valid_metric = self._build_metric(metric, num_classes)
@@ -95,11 +95,11 @@ class MInterface(L.LightningModule):
         return model_cls(**model_kwargs)
 
     @staticmethod
-    def _build_loss(loss: str):
+    def _build_loss(loss: str, num_classes: int, extra_kwargs: dict):
         """根据命令行中的 --loss 创建损失函数。
 
         扩展方法：如果需要新增 focal_loss、dice_loss 等，在这里增加分支即可。
-        对于需要额外超参数的复杂 loss，可以改成普通实例方法并从 self.hparams 读取。
+        复杂 loss 的额外参数会从 main.py 传入的命令行参数中按构造函数签名自动筛选。
         """
         loss = loss.lower()
         if loss == "cross_entropy":
@@ -112,6 +112,18 @@ class MInterface(L.LightningModule):
             return nn.BCEWithLogitsLoss()
         if loss == "loss_f":
             return LossF()
+        if loss == "instance_loss":
+            # InstanceLoss 参数较多，例如 Hungarian matching 权重、aux 权重等。
+            # 这里和模型动态加载保持同一风格：只传入 InstanceLoss.__init__ 真正声明过的参数。
+            signature = inspect.signature(InstanceLoss.__init__)
+            accepted = {
+                name
+                for name, param in signature.parameters.items()
+                if name != "self" and param.kind in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+            }
+            loss_kwargs = {name: extra_kwargs[name] for name in accepted if name in extra_kwargs}
+            loss_kwargs["num_classes"] = num_classes
+            return InstanceLoss(**loss_kwargs)
         raise ValueError(f"未支持的损失函数: {loss}")
 
     @staticmethod
@@ -136,6 +148,19 @@ class MInterface(L.LightningModule):
         if isinstance(output, (list, tuple)):
             return output[0]
         return output
+
+    @staticmethod
+    def _batch_size(images) -> int:
+        """从 tensor 或 list 形式的图像 batch 中取得 batch size。
+
+        FBIS-22M 实例分割数据在图像尺寸不一致时会把 images 保持为 list；Lightning
+        日志聚合仍需要 batch_size，因此这里统一处理两种情况。
+        """
+        if torch.is_tensor(images):
+            return int(images.size(0))
+        if isinstance(images, (list, tuple)):
+            return len(images)
+        return 1
 
     @staticmethod
     def _unpack_batch(batch):
@@ -165,8 +190,31 @@ class MInterface(L.LightningModule):
         _, images, masks, contours, distances = batch
         return images, masks, contours, distances
 
+    @staticmethod
+    def _unpack_instance_batch(batch):
+        """解析 ``InstanceLoss`` 必需的实例分割 batch。
+
+        ``Fbis22mDataset.collate_fn`` 返回字典，其中 ``image`` 是模型输入，完整 batch
+        还包含 ``instances``、``semantic_mask``、``boundary``、``distance`` 等监督信号。
+        InstanceLoss 需要同时看到这些字段，因此 targets 直接传回整个 batch 字典。
+        """
+        if not isinstance(batch, dict) or "image" not in batch or "instances" not in batch:
+            raise ValueError("InstanceLoss requires dict batches from Fbis22mDataset with image and instances keys.")
+        return batch["image"], batch
+
     def _compute_loss(self, batch):
         """根据当前损失函数类型计算单个 batch 的训练或评估损失。"""
+        if isinstance(self.loss_function, InstanceLoss):
+            images, targets = self._unpack_instance_batch(batch)
+            outputs = self(images)
+            if not isinstance(outputs, dict):
+                raise ValueError("InstanceLoss requires InstanceModel to return a prediction dictionary.")
+            loss = self.loss_function(outputs, targets)
+            if isinstance(loss, dict):
+                # InstanceLoss(return_dict=True) 主要用于调试；训练主 loss 仍使用其中的 loss 字段。
+                loss = loss["loss"]
+            return loss, images, outputs["pred_logits"], None
+
         if isinstance(self.loss_function, LossF):
             images, masks, contours, distances = self._unpack_ftw_batch(batch)
             outputs = self(images)
@@ -198,12 +246,13 @@ class MInterface(L.LightningModule):
         loss, images, logits, labels = self._compute_loss(batch)
         metric = self.valid_metric if stage == "val" else self.test_metric
         # torchmetrics 的 update 会累积当前 batch 的状态，compute 由 Lightning 日志系统触发。
-        if metric is not None:
+        if metric is not None and labels is not None:
             metric.update(logits, labels)
         # batch_size 用于 Lightning 在 epoch 级别正确加权聚合 loss/metric。
-        self.log(f"{stage}_loss", loss, prog_bar=True, on_epoch=True, batch_size=images.size(0))
-        if metric is not None:
-            self.log(f"{stage}_{self.metric_name}", metric, prog_bar=True, on_epoch=True, batch_size=images.size(0))
+        batch_size = self._batch_size(images)
+        self.log(f"{stage}_loss", loss, prog_bar=True, on_epoch=True, batch_size=batch_size)
+        if metric is not None and labels is not None:
+            self.log(f"{stage}_{self.metric_name}", metric, prog_bar=True, on_epoch=True, batch_size=batch_size)
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -213,7 +262,7 @@ class MInterface(L.LightningModule):
         zero_grad 等优化流程。除非需要手动优化，一般不要在这里直接调用 optimizer。
         """
         loss, images, _, _ = self._compute_loss(batch)
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=images.size(0))
+        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=self._batch_size(images))
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
@@ -233,8 +282,13 @@ class MInterface(L.LightningModule):
         默认返回 softmax 后的类别概率。若你的任务是回归、分割或检测，请根据输出格式
         修改这里。
         """
-        images, _ = self._unpack_batch(batch)
+        if isinstance(batch, dict) and "image" in batch:
+            images = batch["image"]
+        else:
+            images, _ = self._unpack_batch(batch)
         logits = self._primary_output(self(images))
+        if isinstance(logits, dict):
+            return logits
         if logits.ndim > 2 and logits.size(1) == 1:
             return torch.sigmoid(logits)
         return logits.softmax(dim=1)

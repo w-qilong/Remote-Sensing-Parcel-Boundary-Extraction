@@ -22,3 +22,4 @@ checkpoints/
 .vscode/
 example_Minist_data/
 ftw_data/
+outputs/

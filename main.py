@@ -17,6 +17,7 @@ from __future__ import annotations
 from argparse import ArgumentParser
 
 import lightning as L
+import torch
 from data import DInterface
 from lightning.pytorch.callbacks import (
     EarlyStopping,
@@ -64,30 +65,37 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--fast_dev_run", nargs="?", const=True, default=False, type=str_to_bool) # TDOD: 调试时设置为 true，正式训练时设置为 false。
     # TensorBoard 日志会写入 log_dir/experiment_name。
     parser.add_argument("--log_dir", default="logs")
-    parser.add_argument("--experiment_name", default="dino_dpt_ftw")
+    parser.add_argument("--experiment_name", default="field_dino_mask2former_fbis22m")
     parser.add_argument("--enable_progress_bar", nargs="?", const=True, default=True, type=str_to_bool)
 
-    # 数据参数：默认使用 FTW 的 train/val/test split。
-    parser.add_argument("--train_dataset", default="ftw_dataset")
-    parser.add_argument("--val_datasets", nargs="+", default=["ftw_dataset"])
-    parser.add_argument("--test_datasets", nargs="+", default=["ftw_dataset"])
-    parser.add_argument("--batch_size", default=16, type=int)
+    # 数据参数：默认使用 FBIS-22M 实例分割数据集。
+    parser.add_argument("--train_dataset", default="fbis22m_dataset")
+    parser.add_argument("--val_datasets", nargs="+", default=["fbis22m_dataset"])
+    parser.add_argument("--test_datasets", nargs="+", default=["fbis22m_dataset"])
+    parser.add_argument("--batch_size", default=4, type=int)
     # Windows 或快速调试时建议先用 0；Linux 训练大数据集时可逐步调高。
     parser.add_argument("--num_workers", default=8, type=int)
-    # FTW 数据集默认根目录与国家参数。多个国家时会自动合并到同一个数据集里。
-    parser.add_argument("--data_root", default="ftw_data/ftw_dataset")
-    parser.add_argument("--country", nargs="+", default=["all"]) # 设置为all时会自动选择所有国家的数据。也可以使用 --country ['<country1>', '<country2>']来指定多个国家。
+    # FBIS-22M 数据集默认根目录与 part 过滤参数。data_root=None 时使用 Dataset 内置默认路径。
+    parser.add_argument("--data_root", default=None) # 也可以使用 --data_root <path> 来指定数据集根目录。
+    parser.add_argument("--parts", nargs="+", default=["all"])
+    # 保留 FTW 数据集的 country 参数；切回 --train_dataset ftw_dataset 时仍可复用。
+    parser.add_argument("--country", nargs="+", default=["all"])
+    # FBIS-22M 专用数据参数。resize_size 固定图像尺寸，能避免 batch 内混合尺寸带来的 padding 开销。
+    parser.add_argument("--resize_size", default=512, type=int)
+    parser.add_argument("--boundary_thickness", default=3, type=int)
+    parser.add_argument("--max_samples", default=None, type=int)
     # 以下参数由示例数据集 ExampleData 使用；换成真实数据集后可替换为 data_dir 等参数。
     parser.add_argument("--num_samples", default=128, type=int)
     parser.add_argument("--image_size", default=28, type=int)
 
-    # 模型参数：默认加载 model/hbg_net.py 中的 HbgNet。
-    parser.add_argument("--model_name", default="dino_dpt")
+    # 模型参数：默认加载 model/instance_model.py 中的 DINOv3 + Mask2Former 实例分割网络。
+    parser.add_argument("--model_name", default="instance_model")
     parser.add_argument("--in_channels", default=3, type=int)
-    parser.add_argument("--hidden_dim", default=64, type=int)
-    parser.add_argument("--num_classes", default=2, type=int)
+    parser.add_argument("--hidden_dim", default=256, type=int)
+    # InstanceModel 的 num_classes 不包含 no-object；FBIS-22M 田块实例是单前景类，因此为 1。
+    parser.add_argument("--num_classes", default=1, type=int)
     parser.add_argument("--img_size", default=256, type=int)
-    parser.add_argument("--drop_rate", default=0.4, type=float)
+    parser.add_argument("--drop_rate", default=0.0, type=float)
     parser.add_argument("--pretrained_path", default=None)
     parser.add_argument("--return_aux_outputs", nargs="?", const=True, default=True, type=str_to_bool)
     parser.add_argument("--dino_model_name", default="vit_large_patch16_dinov3.sat493m")
@@ -95,14 +103,35 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--dino_out_indices", nargs="+", default=None, type=int)
     parser.add_argument("--freeze_backbone", nargs="?", const=True, default=False, type=str_to_bool)
     parser.add_argument("--trainable_backbone_blocks", default=2, type=int)
+    # InstanceModel 专用参数；使用 dino_dpt/hbg_net 时会被 MInterface 自动忽略。
+    parser.add_argument("--num_queries", default=300, type=int)
+    parser.add_argument("--decoder_layers", default=9, type=int)
+    parser.add_argument("--decoder_heads", default=8, type=int)
+    parser.add_argument("--decoder_ffn_dim", default=2048, type=int)
 
     # 优化器、损失和指标参数：由 MInterface 统一解释并创建对应对象。
     # 如果需要新增 loss/metric/optimizer，请同步扩展 model/model_interface.py。
     parser.add_argument(
         "--loss",
-        choices=["cross_entropy", "mse", "triplet_margin_loss", "bce_with_logits", "loss_f"],
-        default="loss_f",
+        choices=["cross_entropy", "mse", "triplet_margin_loss", "bce_with_logits", "loss_f", "instance_loss"],
+        default="instance_loss",
     )
+    # InstanceLoss 权重参数；默认值来自 docs/field-dino-mask2former-design.md。
+    # 对于非 instance_loss 路径，这些参数会被保存在 hparams 中但不会参与计算。
+    parser.add_argument("--eos_coef", default=0.1, type=float)
+    parser.add_argument("--class_weight", default=2.0, type=float)
+    parser.add_argument("--mask_weight", default=5.0, type=float)
+    parser.add_argument("--dice_weight", default=5.0, type=float)
+    parser.add_argument("--box_weight", default=2.0, type=float)
+    parser.add_argument("--giou_weight", default=2.0, type=float)
+    parser.add_argument("--union_weight", default=0.5, type=float)
+    parser.add_argument("--boundary_weight", default=1.0, type=float)
+    parser.add_argument("--distance_weight", default=0.2, type=float)
+    parser.add_argument("--aux_weight", default=1.0, type=float)
+    parser.add_argument("--boundary_focal_alpha", default=0.25, type=float)
+    parser.add_argument("--boundary_focal_gamma", default=2.0, type=float)
+    # Mask matching/loss 只在采样点上计算，避免 512x512 全图 pairwise BCE 导致显存爆炸。
+    parser.add_argument("--num_mask_points", default=4096, type=int)
     parser.add_argument("--metric", choices=["accuracy", "recall", "none"], default="none")
     parser.add_argument("--optimizer", choices=["sgd", "adam", "adamw"], default="adamw")
     parser.add_argument("--lr", default=1e-4, type=float)
@@ -187,6 +216,9 @@ def main(args=None) -> None:
     args = parser.parse_args(args=args)
     # 固定随机种子，workers=True 会同步 DataLoader worker 的随机状态。
     L.seed_everything(args.seed, workers=True)
+    # RTX 4090 等带 Tensor Cores 的显卡会提示设置 float32 matmul precision。
+    # high 通常能在保持较好数值精度的同时启用 TF32 加速矩阵乘法。
+    torch.set_float32_matmul_precision("high")
 
     # vars(args) 会把 argparse Namespace 转成 dict，方便 DInterface/MInterface
     # 自动筛选自己需要的参数。
@@ -196,8 +228,11 @@ def main(args=None) -> None:
     # fit 会按 Lightning 标准流程调用 data_module.setup、train_dataloader、
     # model.training_step、model.validation_step 等 hook。
     trainer.fit(model, datamodule=data_module)
-    # 训练结束后使用验证集上最优 checkpoint 在测试集上评估模型。
-    trainer.test(model, datamodule=data_module, ckpt_path="best")
+    # fast_dev_run 只用于快速检查训练/验证链路，Lightning 不会保存 best checkpoint。
+    # 因此这里跳过 test，避免 ckpt_path="best" 在调试模式下报错。
+    if not args.fast_dev_run:
+        # 训练结束后使用验证集上最优 checkpoint 在测试集上评估模型。
+        trainer.test(model, datamodule=data_module, ckpt_path="best")
 
 
 if __name__ == "__main__":
