@@ -64,7 +64,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--fast_dev_run", nargs="?", const=True, default=False, type=str_to_bool) # TDOD: 调试时设置为 true，正式训练时设置为 false。
     # TensorBoard 日志会写入 log_dir/experiment_name。
     parser.add_argument("--log_dir", default="logs")
-    parser.add_argument("--experiment_name", default="hbg_net_ftw")
+    parser.add_argument("--experiment_name", default="dino_dpt_ftw")
     parser.add_argument("--enable_progress_bar", nargs="?", const=True, default=True, type=str_to_bool)
 
     # 数据参数：默认使用 FTW 的 train/val/test split。
@@ -82,7 +82,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--image_size", default=28, type=int)
 
     # 模型参数：默认加载 model/hbg_net.py 中的 HbgNet。
-    parser.add_argument("--model_name", default="hbg_net")
+    parser.add_argument("--model_name", default="dino_dpt")
     parser.add_argument("--in_channels", default=3, type=int)
     parser.add_argument("--hidden_dim", default=64, type=int)
     parser.add_argument("--num_classes", default=2, type=int)
@@ -90,6 +90,11 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--drop_rate", default=0.4, type=float)
     parser.add_argument("--pretrained_path", default=None)
     parser.add_argument("--return_aux_outputs", nargs="?", const=True, default=True, type=str_to_bool)
+    parser.add_argument("--dino_model_name", default="vit_large_patch16_dinov3.sat493m")
+    parser.add_argument("--dino_pretrained", nargs="?", const=True, default=True, type=str_to_bool)
+    parser.add_argument("--dino_out_indices", nargs="+", default=None, type=int)
+    parser.add_argument("--freeze_backbone", nargs="?", const=True, default=False, type=str_to_bool)
+    parser.add_argument("--trainable_backbone_blocks", default=2, type=int)
 
     # 优化器、损失和指标参数：由 MInterface 统一解释并创建对应对象。
     # 如果需要新增 loss/metric/optimizer，请同步扩展 model/model_interface.py。

@@ -34,11 +34,11 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 # checkpoint 是唯一必填项：它应指向训练过程中 ModelCheckpoint 保存的 .ckpt 文件。
 # country 支持单国家、多国家或 "all"，规则与 FtwDataset 保持一致。
 PREDICT_CONFIG_DEFAULTS = {
-    "checkpoint": 'logs/hbg_net_ftw/version_2/checkpoints/best-24.ckpt',
+    "checkpoint": 'logs/dino_dpt_ftw/version_0/checkpoints/best-12.ckpt',
     "data_root": "ftw_data/ftw_dataset",
     "country": ["austria"],
     "split": "test",
-    "output_dir": Path("predictions") / "ftw_test",
+    "output_dir": Path("predictions") / "ftw_test_dpt1",
     "batch_size": 1,
     "num_workers": 0,
     "max_samples": 40, # None 表示保存整个 split；调试时可设置为较小值快速查看结果。

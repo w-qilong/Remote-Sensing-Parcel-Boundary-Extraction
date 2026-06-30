@@ -9,6 +9,8 @@ pytest-cache-files-*/
 venv/
 .codex/
 .agents/
+weights/
+datasets/
 
 logs/
 Logs/
