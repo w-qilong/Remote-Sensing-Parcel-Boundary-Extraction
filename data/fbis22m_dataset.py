@@ -2,7 +2,7 @@
 
 本模块面向 ``Field-DINO-Mask2Former`` 设计：从 FBIS-22M 的
 ``images``/``labels`` 目录读取影像和 YOLO polygon 标签，并在运行时生成
-实例分割训练所需的 masks、boxes、semantic mask、boundary 和 distance map。
+实例分割训练所需的 masks、boxes、boundary 和 distance map。
 
 文件名遵循项目动态加载约定：
 ``fbis22m_dataset.py`` -> ``Fbis22mDataset``。
@@ -427,15 +427,6 @@ def rasterize_instances(
     )
 
 
-def make_semantic_mask(instance_masks: np.ndarray) -> np.ndarray:
-    """Create a union field mask from instance masks."""
-
-    if instance_masks.shape[0] == 0:
-        return np.zeros(instance_masks.shape[1:], dtype=np.uint8)
-    # union mask 用于辅助语义分割监督：只关心“是否属于任意田块”，不区分实例 id。
-    return (instance_masks.max(axis=0) > 0).astype(np.uint8)
-
-
 def make_boundary_map(instance_masks: np.ndarray, thickness: int = 3) -> np.ndarray:
     """Create a binary boundary map from instance masks."""
 
@@ -456,19 +447,44 @@ def make_boundary_map(instance_masks: np.ndarray, thickness: int = 3) -> np.ndar
     return boundary.astype(np.uint8)
 
 
-def make_distance_map(semantic_mask: np.ndarray, normalize: bool = True) -> np.ndarray:
-    """Create an interior distance transform map for field regions."""
+def make_distance_map(instance_masks: np.ndarray, normalize: bool = True) -> np.ndarray:
+    """Create an interior distance transform map for each field instance.
 
-    if semantic_mask.max() == 0:
-        return np.zeros_like(semantic_mask, dtype=np.float32)
+    ``instance_masks`` 推荐传入形状为 ``[N, H, W]`` 的实例二值 mask。函数会对
+    每个实例单独计算距离变换，再把结果合并成一张 ``[H, W]`` dense target。
+    这样相邻田块不会因为 mask union 被连接成一个大区域，实例共享边附近
+    仍会保持靠近边界的低距离值。
+    """
 
-    # distanceTransform 只在前景内部产生正值；越靠近田块中心，距离通常越大。
-    # 这类几何辅助监督有助于模型区分田块内部与边界附近的像素。
-    distance = cv2.distanceTransform(semantic_mask.astype(np.uint8), cv2.DIST_L2, 5)
-    if normalize and distance.max() > 0:
-        # 归一化到 [0, 1]，使不同尺寸田块的距离图处在相近数值范围。
-        distance = distance / distance.max()
-    return distance.astype(np.float32)
+    if instance_masks.ndim == 2:
+        # 兼容旧调用：二维输入被视为单个实例 mask。FBIS Dataset 内部会传入
+        # 三维实例 masks，才能准确保留相邻实例之间的边界语义。
+        instance_masks = instance_masks[None, :, :]
+    if instance_masks.ndim != 3:
+        raise ValueError(f"Expected instance_masks with shape [N, H, W], got {instance_masks.shape}")
+
+    if instance_masks.shape[0] == 0:
+        return np.zeros(instance_masks.shape[1:], dtype=np.float32)
+
+    distance_map = np.zeros(instance_masks.shape[1:], dtype=np.float32)
+    for mask in instance_masks:
+        mask_uint8 = (mask > 0).astype(np.uint8)
+        if mask_uint8.max() == 0:
+            # 极小退化实例可能在栅格化后为空；跳过可避免无意义的除零和噪声。
+            continue
+
+        # distanceTransform 必须在单个实例内部计算。若先把所有实例做 union，
+        # 相邻或接触的田块会被误认为同一个连通区域，中心距离会跨实例扩张。
+        instance_distance = cv2.distanceTransform(mask_uint8, cv2.DIST_L2, 5)
+        if normalize and instance_distance.max() > 0:
+            # 按实例各自归一化到 [0, 1]，让小田块也能提供足够强的距离监督。
+            instance_distance = instance_distance / instance_distance.max()
+
+        # 多个实例合成 dense distance target。重叠像素取较大值，表示它至少位于
+        # 某个实例的内部较深处；非重叠区域则天然保留各实例自己的距离形态。
+        distance_map = np.maximum(distance_map, instance_distance.astype(np.float32))
+
+    return distance_map.astype(np.float32)
 
 
 def image_to_tensor(
@@ -532,7 +548,6 @@ class Fbis22mDataset(Dataset):
     返回的关键字段：
     - ``image``: 归一化后的影像张量，形状为 ``[3, H, W]``。
     - ``instances``: 实例级标注字典，包含 ``masks``、``boxes``、``labels``。
-    - ``semantic_mask``: 所有实例的并集，用于语义辅助损失。
     - ``boundary``: 实例边界并集，用于边界辅助损失。
     - ``distance``: 前景内部距离变换，用于几何辅助损失。
     """
@@ -605,10 +620,10 @@ class Fbis22mDataset(Dataset):
         # 3. 从 polygon 生成实例分割监督：masks/boxes/labels。
         masks_np, boxes_np, labels_np = rasterize_instances(polygons, height, width)
 
-        # 4. 生成 dense auxiliary targets，对应设计文档中的 union/boundary/distance 分支。
-        semantic_np = make_semantic_mask(masks_np)
+        # 4. 生成辅助监督。模型设计中不再预测语义分割 mask，因此只保留
+        # boundary/distance 两个 dense target；二者都按实例内部逻辑生成。
         boundary_np = make_boundary_map(masks_np, thickness=self.boundary_thickness)
-        distance_np = make_distance_map(semantic_np)
+        distance_np = make_distance_map(masks_np)
 
         # DETR/Mask2Former 训练通常让每张图保留自己的 instances dict；
         # batch 维度由 collate_fn 组织，不能在这里强行 stack 不同 N 的实例。
@@ -624,7 +639,6 @@ class Fbis22mDataset(Dataset):
             "file_name": sample.display_name,
             "image": image_to_tensor(image_rgb, normalize=self.normalize_image),
             "instances": instances,
-            "semantic_mask": torch.from_numpy(semantic_np[None, :, :]).float(),
             "boundary": torch.from_numpy(boundary_np[None, :, :]).long(),
             "distance": torch.from_numpy(distance_np[None, :, :]).float(),
             "height": height,
@@ -650,9 +664,9 @@ class Fbis22mDataset(Dataset):
     def collate_fn(batch: Sequence[dict[str, object]]) -> dict[str, object]:
         """Collate variable-length instance annotations.
 
-        Images and dense auxiliary targets are stacked when they have equal spatial
-        shape. Instance dictionaries remain as a list, following common DETR and
-        Mask2Former training conventions.
+        Images and single-channel dense auxiliary targets are stacked when they have
+        equal spatial shape. Instance dictionaries remain as a list because each image
+        can contain a different number of instances.
         """
 
         if not batch:
@@ -662,7 +676,7 @@ class Fbis22mDataset(Dataset):
         # 若混合 256/512 原图，则保持 list，后续模型或训练循环可自行 pad/resize。
         image_shapes = {tuple(item["image"].shape) for item in batch}  # type: ignore[index, union-attr]
         can_stack_images = len(image_shapes) == 1
-        dense_keys = ("semantic_mask", "boundary", "distance")
+        dense_keys = ("boundary", "distance")
 
         # 变长实例标注保持 list[dict]，这是 DETR/Mask2Former 常见 batch 约定。
         output: dict[str, object] = {
@@ -702,7 +716,6 @@ if __name__ == "__main__":
     # 轻量手动检查入口：运行本文件会读取一个样本并打印核心张量形状。
     # 完整训练仍应通过 data.DInterface 和 main.py 启动。
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
 
     dataset = FBIS22MInstanceDataset(split="all", max_samples=1, return_polygons=True)
     sample = dataset[0]
@@ -711,7 +724,6 @@ if __name__ == "__main__":
     masks = instances["masks"]  # type: ignore[index]
     boxes = instances["boxes"]  # type: ignore[index]
     labels = instances["labels"]  # type: ignore[index]
-    semantic_mask = sample["semantic_mask"]
     boundary = sample["boundary"]
     distance = sample["distance"]
 
@@ -722,7 +734,6 @@ if __name__ == "__main__":
     print("mask areas:", masks.flatten(1).sum(dim=1).tolist())
     print("boxes xyxy:\n", boxes)
     print("labels:", labels.tolist())
-    print("semantic:", tuple(sample["semantic_mask"].shape))
     print("boundary:", tuple(boundary.shape), boundary.dtype)
     print("distance:", tuple(distance.shape), distance.dtype)
 
@@ -733,9 +744,6 @@ if __name__ == "__main__":
     image_np = (image * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
 
     masks_np = masks.detach().cpu().numpy()
-    boxes_np = boxes.detach().cpu().numpy()
-    labels_np = labels.detach().cpu().numpy()
-    semantic_np = semantic_mask.squeeze(0).detach().cpu().numpy()
     boundary_np = boundary.squeeze(0).detach().cpu().numpy()
     distance_np = distance.squeeze(0).detach().cpu().numpy()
 
@@ -748,27 +756,7 @@ if __name__ == "__main__":
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
     axes[0, 0].imshow(image_np)
-    axes[0, 0].set_title("Image + boxes/labels")
-    for box, label in zip(boxes_np, labels_np):
-        x_min, y_min, x_max, y_max = box
-        axes[0, 0].add_patch(
-            Rectangle(
-                (x_min, y_min),
-                x_max - x_min,
-                y_max - y_min,
-                fill=False,
-                edgecolor="yellow",
-                linewidth=1.2,
-            )
-        )
-        axes[0, 0].text(
-            x_min,
-            y_min,
-            str(int(label)),
-            color="black",
-            fontsize=8,
-            bbox={"facecolor": "yellow", "alpha": 0.8, "pad": 1},
-        )
+    axes[0, 0].set_title("Image")
 
     axes[0, 1].imshow(instance_id_map, cmap="tab20")
     axes[0, 1].set_title("Instance masks")
@@ -777,8 +765,9 @@ if __name__ == "__main__":
     axes[0, 2].imshow(instance_id_map, cmap="tab20", alpha=0.45)
     axes[0, 2].set_title("Image + instance masks")
 
-    axes[1, 0].imshow(semantic_np, cmap="gray")
-    axes[1, 0].set_title("semantic_mask")
+    axes[1, 0].imshow(image_np)
+    axes[1, 0].imshow(boundary_np, cmap="gray", alpha=0.65)
+    axes[1, 0].set_title("Image + boundary")
 
     axes[1, 1].imshow(boundary_np, cmap="gray")
     axes[1, 1].set_title("boundary")

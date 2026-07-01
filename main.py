@@ -124,7 +124,6 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--dice_weight", default=5.0, type=float)
     parser.add_argument("--box_weight", default=2.0, type=float)
     parser.add_argument("--giou_weight", default=2.0, type=float)
-    parser.add_argument("--union_weight", default=0.5, type=float)
     parser.add_argument("--boundary_weight", default=1.0, type=float)
     parser.add_argument("--distance_weight", default=0.2, type=float)
     parser.add_argument("--aux_weight", default=1.0, type=float)

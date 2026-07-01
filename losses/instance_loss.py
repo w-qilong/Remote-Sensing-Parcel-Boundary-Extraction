@@ -6,7 +6,7 @@
 1. 对每张图的 ``Q`` 个预测 query 和 ``M`` 个真实田块实例做 Hungarian matching；
 2. 对匹配成功的 query 计算类别、实例 mask、Dice、box L1 和 GIoU 损失；
 3. 对未匹配 query 监督为 no-object；
-4. 额外监督语义并集 mask、边界图和距离图；
+4. 额外监督边界图和距离图；
 5. 可选对 decoder 中间层 ``aux_outputs`` 重复实例损失，增强深层 decoder 训练稳定性。
 
 为了避免高分辨率 mask 在 Hungarian matching 中构造巨大的
@@ -50,7 +50,7 @@ def _as_tensor_target_list(targets: Any) -> list[Mapping[str, torch.Tensor]]:
     """从完整 batch 或实例列表中取出 matcher 需要的 targets。
 
     支持两种输入：
-    - ``batch`` 字典：包含 ``instances``、``semantic_mask``、``boundary``、``distance``；
+    - ``batch`` 字典：包含 ``instances``、``boundary``、``distance``；
     - ``list[instances]``：每个元素包含 ``masks``、``boxes``、``labels``。
     """
 
@@ -395,7 +395,7 @@ class InstanceLoss(nn.Module):
 
     默认权重与设计文档保持一致：
     - class=2, mask=5, dice=5, box=2, giou=2；
-    - union=0.5, boundary=1.0, distance=0.2；
+    - boundary=1.0, distance=0.2；
     - aux decoder layers 使用和主实例分支相同的权重。
     """
 
@@ -408,7 +408,6 @@ class InstanceLoss(nn.Module):
         dice_weight: float = 5.0,
         box_weight: float = 2.0,
         giou_weight: float = 2.0,
-        union_weight: float = 0.5,
         boundary_weight: float = 1.0,
         distance_weight: float = 0.2,
         aux_weight: float = 1.0,
@@ -427,7 +426,6 @@ class InstanceLoss(nn.Module):
         self.dice_weight = dice_weight
         self.box_weight = box_weight
         self.giou_weight = giou_weight
-        self.union_weight = union_weight
         self.boundary_weight = boundary_weight
         self.distance_weight = distance_weight
         self.aux_weight = aux_weight
@@ -575,14 +573,13 @@ class InstanceLoss(nn.Module):
         outputs: Mapping[str, torch.Tensor],
         batch_targets: Any,
     ) -> dict[str, torch.Tensor]:
-        """计算 union mask、boundary 和 distance 三个 dense auxiliary 损失。"""
+        """计算 boundary 和 distance 两个 dense auxiliary 损失。"""
 
         device = outputs["pred_logits"].device
         output_size = outputs["pred_masks"].shape[-2:]
         losses: dict[str, torch.Tensor] = {}
 
         if isinstance(batch_targets, Mapping):
-            semantic_target = _stack_or_pad_dense_target(batch_targets.get("semantic_mask"), output_size, device)
             boundary_target = _stack_or_pad_dense_target(batch_targets.get("boundary"), output_size, device)
             distance_target = _stack_or_pad_dense_target(
                 batch_targets.get("distance"),
@@ -591,19 +588,7 @@ class InstanceLoss(nn.Module):
                 interpolation_mode="bilinear",
             )
         else:
-            semantic_target = boundary_target = distance_target = None
-
-        if semantic_target is not None and "semantic_logits" in outputs:
-            semantic_logits = outputs["semantic_logits"]
-            if semantic_logits.shape[-2:] != semantic_target.shape[-2:]:
-                semantic_logits = F.interpolate(
-                    semantic_logits,
-                    size=semantic_target.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            losses["loss_union_bce"] = F.binary_cross_entropy_with_logits(semantic_logits, semantic_target.float())
-            losses["loss_union_dice"] = _dice_loss(semantic_logits, semantic_target.float(), semantic_target.shape[0])
+            boundary_target = distance_target = None
 
         if boundary_target is not None and "boundary_logits" in outputs:
             boundary_logits = outputs["boundary_logits"]
@@ -656,9 +641,6 @@ class InstanceLoss(nn.Module):
                 total = total + self.box_weight * value
             elif name.endswith("loss_giou"):
                 total = total + self.giou_weight * value
-            elif name in {"loss_union_bce", "loss_union_dice"}:
-                # union mask 由 BCE 和 Dice 两部分组成，共同乘 union_weight。
-                total = total + self.union_weight * value
             elif name == "loss_boundary":
                 total = total + self.boundary_weight * value
             elif name == "loss_distance":

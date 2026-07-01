@@ -112,3 +112,64 @@ def test_model_interface_runs_loss_f_training_step(monkeypatch):
 
     assert loss.ndim == 0
     assert loss.requires_grad
+
+
+def test_model_interface_logs_instance_validation_metrics(monkeypatch):
+    """实例分割验证时应累积实例指标，供 epoch 结束写入日志。"""
+    from model import MInterface
+
+    class TinyInstanceNet(nn.Module):
+        """返回确定性实例分割输出的小模型，避免测试加载 DINO/Mask2Former 大网络。"""
+
+        def forward(self, images):
+            batch_size, _, height, width = images.shape
+            device = images.device
+            pred_logits = torch.full((batch_size, 2, 2), -5.0, device=device)
+            # 第 0 个 query 是高置信度前景，第 1 个 query 是 no-object。
+            pred_logits[:, 0, 0] = 5.0
+            pred_logits[:, 0, 1] = -5.0
+            pred_logits[:, 1, 0] = -5.0
+            pred_logits[:, 1, 1] = 5.0
+
+            pred_masks = torch.full((batch_size, 2, height, width), -6.0, device=device)
+            pred_masks[:, 0, 1:3, 1:3] = 6.0
+
+            return {
+                "pred_logits": pred_logits,
+                "pred_masks": pred_masks,
+                "pred_boxes": torch.tensor([[[0.5, 0.5, 0.5, 0.5], [0.1, 0.1, 0.1, 0.1]]], device=device),
+            }
+
+    monkeypatch.setattr(MInterface, "_load_model", lambda self, model_name, extra_kwargs: TinyInstanceNet())
+
+    module = MInterface(
+        model_name="instance_model",
+        loss="instance_loss",
+        metric="none",
+        optimizer="adam",
+        lr=1e-3,
+        weight_decay=0.0,
+        lr_scheduler="none",
+        num_classes=1,
+    )
+    mask = torch.zeros(1, 4, 4)
+    mask[:, 1:3, 1:3] = 1.0
+    batch = {
+        "image": torch.zeros(1, 3, 4, 4),
+        "instances": [
+            {
+                "masks": mask,
+                "boxes": torch.tensor([[1.0, 1.0, 3.0, 3.0]]),
+                "labels": torch.tensor([0]),
+            }
+        ],
+    }
+
+    module.on_validation_epoch_start()
+    loss = module.validation_step(batch, 0)
+    logs = module._compute_segmentation_metric_logs("val")
+
+    assert loss.ndim == 0
+    assert torch.isclose(logs["val_instance_precision_50"], torch.tensor(1.0, dtype=logs["val_instance_precision_50"].dtype))
+    assert torch.isclose(logs["val_instance_recall_50"], torch.tensor(1.0, dtype=logs["val_instance_recall_50"].dtype))
+    assert torch.isclose(logs["val_instance_f1_50"], torch.tensor(1.0, dtype=logs["val_instance_f1_50"].dtype))

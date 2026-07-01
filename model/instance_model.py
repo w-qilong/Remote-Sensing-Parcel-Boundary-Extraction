@@ -12,7 +12,6 @@
     "pred_masks":  Tensor[B, Q, H, W],
     "pred_boxes":  Tensor[B, Q, 4],
     "aux_outputs": list[dict],
-    "semantic_logits": Tensor[B, 1, H, W],
     "boundary_logits": Tensor[B, 2, H, W],
     "distance_map": Tensor[B, 1, H, W],
 }
@@ -588,14 +587,11 @@ class InstanceModel(nn.Module):
             dropout=drop_rate,
         )
 
-        # 三个 dense auxiliary head 都接在高分辨率 mask_features 上：
-        # semantic_head: 前景/田块区域 logits；
+        # 两个 dense auxiliary head 都接在高分辨率 mask_features 上：
         # boundary_head: 边界二分类 logits；
         # distance_head: 到边界或中心的距离回归图，具体监督由 loss 定义。
-        self.semantic_head = nn.Conv2d(hidden_dim, 1, kernel_size=1)
         self.boundary_head = nn.Conv2d(hidden_dim, 2, kernel_size=1)
         self.distance_head = nn.Conv2d(hidden_dim, 1, kernel_size=1)
-        self.semantic_head.apply(_init_decoder_weights)
         self.boundary_head.apply(_init_decoder_weights)
         self.distance_head.apply(_init_decoder_weights)
 
@@ -708,7 +704,7 @@ class InstanceModel(nn.Module):
 
         输入可以是标准 ``Tensor[B, C, H, W]``，也可以是由 Dataset collate 出来的
         ``list[Tensor[C, H_i, W_i]]``。输出字典中的主任务结果是 query 级实例预测，
-        辅助结果用于语义区域、边界和距离图监督。
+        辅助结果用于边界和距离图监督，不再预测语义分割 mask。
         """
 
         if isinstance(images, (list, tuple)):
@@ -734,13 +730,7 @@ class InstanceModel(nn.Module):
             output_size=output_size,
         )
 
-        # 4. 三个 dense auxiliary head 都从 mask_features 预测，并插值回输入图大小。
-        semantic_logits = F.interpolate(
-            self.semantic_head(mask_features),
-            size=output_size,
-            mode="bilinear",
-            align_corners=False,
-        )
+        # 4. dense auxiliary head 从 mask_features 预测边界和距离图，并插值回输入图大小。
         boundary_logits = F.interpolate(
             self.boundary_head(mask_features),
             size=output_size,
@@ -759,7 +749,6 @@ class InstanceModel(nn.Module):
             "pred_logits": instance_outputs["pred_logits"],  # type: ignore[dict-item]
             "pred_masks": instance_outputs["pred_masks"],  # type: ignore[dict-item]
             "pred_boxes": instance_outputs["pred_boxes"],  # type: ignore[dict-item]
-            "semantic_logits": semantic_logits,
             "boundary_logits": boundary_logits,
             "distance_map": distance_map,
         }
@@ -784,6 +773,5 @@ if __name__ == "__main__":
     print("pred_logits:", output["pred_logits"].shape)
     print("pred_masks:", output["pred_masks"].shape)
     print("pred_boxes:", output["pred_boxes"].shape)
-    print("semantic_logits:", output["semantic_logits"].shape)
     print("boundary_logits:", output["boundary_logits"].shape)
     print("distance_map:", output["distance_map"].shape)

@@ -13,10 +13,12 @@ model/ 下添加普通 nn.Module，再通过 --model_name 指定即可。
 
 import importlib
 import inspect
+from collections.abc import Mapping
 
 import lightning as L
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.optim import lr_scheduler as schedulers
 from torchmetrics.classification import MulticlassAccuracy, MulticlassRecall
 from losses import InstanceLoss, LossF
@@ -57,6 +59,14 @@ class MInterface(L.LightningModule):
         # 验证集和测试集使用独立 metric 实例，避免状态互相污染。
         self.valid_metric = self._build_metric(metric, num_classes)
         self.test_metric = self._build_metric(metric, num_classes)
+        # 实例分割验证指标的后处理阈值。这里先固定为常见默认值，后续如需做阈值搜索，
+        # 可以把这两个字段提升为 main.py 中的命令行参数。
+        self.instance_metric_score_threshold = 0.5
+        self.instance_metric_mask_threshold = 0.5
+        self.instance_metric_iou_thresholds = (0.5, 0.75)
+        # 实例指标用手动累积方式统计，避免在每个 batch 只记录局部均值。
+        # key 为 "val"/"test"，value 为一组 Tensor 计数器。
+        self._segmentation_metric_states: dict[str, dict[str, torch.Tensor] | None] = {}
 
     def _load_model(self, model_name: str, extra_kwargs: dict):
         """根据模型文件名动态导入 nn.Module 类并实例化。
@@ -195,12 +205,263 @@ class MInterface(L.LightningModule):
         """解析 ``InstanceLoss`` 必需的实例分割 batch。
 
         ``Fbis22mDataset.collate_fn`` 返回字典，其中 ``image`` 是模型输入，完整 batch
-        还包含 ``instances``、``semantic_mask``、``boundary``、``distance`` 等监督信号。
+        还包含 ``instances``、``boundary``、``distance`` 等监督信号。
         InstanceLoss 需要同时看到这些字段，因此 targets 直接传回整个 batch 字典。
         """
         if not isinstance(batch, dict) or "image" not in batch or "instances" not in batch:
             raise ValueError("InstanceLoss requires dict batches from Fbis22mDataset with image and instances keys.")
         return batch["image"], batch
+
+    @staticmethod
+    def _iou_suffix(iou_threshold: float) -> str:
+        """把 IoU 阈值转成日志名后缀，例如 0.5 -> ``50``。"""
+        return f"{int(round(iou_threshold * 100)):02d}"
+
+    def _new_segmentation_metric_state(self, device: torch.device) -> dict[str, torch.Tensor]:
+        """创建实例分割指标的累积计数器。
+
+        所有计数器都使用 float64，原因是一个验证 epoch 可能累积很多像素；float64
+        能降低大图像场景下交并比统计的舍入误差。最终写入日志时仍会按标量处理。
+        """
+        state = {
+            "instance_pred_count": torch.zeros((), device=device, dtype=torch.float64),
+            "instance_gt_count": torch.zeros((), device=device, dtype=torch.float64),
+        }
+        for iou_threshold in self.instance_metric_iou_thresholds:
+            suffix = self._iou_suffix(iou_threshold)
+            state[f"instance_tp_{suffix}"] = torch.zeros((), device=device, dtype=torch.float64)
+            state[f"instance_fp_{suffix}"] = torch.zeros((), device=device, dtype=torch.float64)
+            state[f"instance_fn_{suffix}"] = torch.zeros((), device=device, dtype=torch.float64)
+            state[f"instance_iou_sum_{suffix}"] = torch.zeros((), device=device, dtype=torch.float64)
+        return state
+
+    def _reset_segmentation_metric_state(self, stage: str) -> None:
+        """在每个验证/测试 epoch 开始时清空累积指标。"""
+        self._segmentation_metric_states[stage] = None
+
+    def _get_segmentation_metric_state(self, stage: str, device: torch.device) -> dict[str, torch.Tensor]:
+        """按需创建当前阶段的指标状态，并确保状态张量位于正确设备。"""
+        state = self._segmentation_metric_states.get(stage)
+        if state is None:
+            state = self._new_segmentation_metric_state(device)
+            self._segmentation_metric_states[stage] = state
+        return state
+
+    @staticmethod
+    def _crop_or_resize_mask_logits(mask_logits: torch.Tensor, target_size: tuple[int, int]) -> torch.Tensor:
+        """把预测 mask/logit 对齐到单张 GT mask 的空间尺寸。
+
+        当 batch 中图像尺寸不一致时，InstanceModel 会把输入 padding 到最大 H/W。
+        对较小样本，预测的右下区域对应 padding，不应参与指标统计；因此先裁剪有效
+        区域，再在必要时插值到 GT 尺寸。
+        """
+        target_height, target_width = target_size
+        valid_height = min(mask_logits.shape[-2], target_height)
+        valid_width = min(mask_logits.shape[-1], target_width)
+        mask_logits = mask_logits[..., :valid_height, :valid_width]
+        if mask_logits.shape[-2:] != target_size:
+            mask_logits = F.interpolate(
+                mask_logits,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return mask_logits
+
+    @staticmethod
+    def _pairwise_mask_iou(pred_masks: torch.Tensor, target_masks: torch.Tensor) -> torch.Tensor:
+        """计算预测实例 mask 与 GT 实例 mask 的两两 IoU 矩阵。
+
+        输入均为二值张量，形状分别是 ``[P,H,W]`` 和 ``[G,H,W]``。返回 ``[P,G]``，
+        用于后续按置信度贪心匹配实例。
+        """
+        if pred_masks.numel() == 0 or target_masks.numel() == 0:
+            return pred_masks.new_zeros((pred_masks.shape[0], target_masks.shape[0]))
+
+        pred_flat = pred_masks.flatten(1).float()
+        target_flat = target_masks.flatten(1).float()
+        intersection = pred_flat @ target_flat.T
+        pred_area = pred_flat.sum(dim=1)[:, None]
+        target_area = target_flat.sum(dim=1)[None, :]
+        union = pred_area + target_area - intersection
+        return intersection / union.clamp(min=1e-6)
+
+    def _greedy_instance_match_counts(
+        self,
+        pairwise_iou: torch.Tensor,
+        scores: torch.Tensor,
+        iou_threshold: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """按预测置信度执行实例级贪心匹配，并返回 TP/FP/FN/匹配 IoU 总和。
+
+        这里的匹配只用于验证指标，不参与训练反传。每个预测最多匹配一个 GT，每个 GT
+        也最多被一个预测命中，符合实例分割 precision/recall 的基本统计方式。
+        """
+        device = pairwise_iou.device
+        num_predictions, num_targets = pairwise_iou.shape
+        if num_predictions == 0:
+            return (
+                torch.zeros((), device=device, dtype=torch.float64),
+                torch.zeros((), device=device, dtype=torch.float64),
+                torch.as_tensor(float(num_targets), device=device, dtype=torch.float64),
+                torch.zeros((), device=device, dtype=torch.float64),
+            )
+        if num_targets == 0:
+            return (
+                torch.zeros((), device=device, dtype=torch.float64),
+                torch.as_tensor(float(num_predictions), device=device, dtype=torch.float64),
+                torch.zeros((), device=device, dtype=torch.float64),
+                torch.zeros((), device=device, dtype=torch.float64),
+            )
+
+        order = torch.argsort(scores, descending=True)
+        matched_targets: set[int] = set()
+        true_positive = 0.0
+        false_positive = 0.0
+        matched_iou_sum = 0.0
+        # 指标统计不需要梯度，转成 Python 标量可以让“GT 是否已匹配”的逻辑更清晰。
+        for pred_index in order.tolist():
+            best_iou, best_target = pairwise_iou[pred_index].max(dim=0)
+            best_target_index = int(best_target.item())
+            best_iou_value = float(best_iou.item())
+            if best_iou_value >= iou_threshold and best_target_index not in matched_targets:
+                true_positive += 1.0
+                matched_iou_sum += best_iou_value
+                matched_targets.add(best_target_index)
+            else:
+                false_positive += 1.0
+
+        false_negative = float(num_targets - len(matched_targets))
+        return (
+            torch.as_tensor(true_positive, device=device, dtype=torch.float64),
+            torch.as_tensor(false_positive, device=device, dtype=torch.float64),
+            torch.as_tensor(false_negative, device=device, dtype=torch.float64),
+            torch.as_tensor(matched_iou_sum, device=device, dtype=torch.float64),
+        )
+
+    def _update_instance_metric_state(
+        self,
+        state: dict[str, torch.Tensor],
+        outputs: Mapping[str, torch.Tensor],
+        batch: Mapping[str, object],
+    ) -> None:
+        """累积实例分割 precision/recall/F1 和匹配 mask IoU 所需的计数。"""
+        if "pred_logits" not in outputs or "pred_masks" not in outputs or "instances" not in batch:
+            return
+
+        pred_logits = outputs["pred_logits"]
+        pred_masks = outputs["pred_masks"]
+        instances = batch["instances"]
+        if not isinstance(instances, (list, tuple)):
+            raise TypeError("Instance segmentation metrics expect batch['instances'] to be a list.")
+
+        device = pred_logits.device
+        class_prob = pred_logits.softmax(dim=-1)
+        # 最后一类是 no-object；实例指标只看真实类别的最大概率作为 query 置信度。
+        foreground_prob = class_prob[..., :-1]
+        if foreground_prob.shape[-1] == 0:
+            scores = 1.0 - class_prob[..., -1]
+        else:
+            scores = foreground_prob.max(dim=-1).values
+
+        for batch_index, target in enumerate(instances):
+            target_masks = target["masks"].to(device).float()  # type: ignore[index]
+            target_binary = target_masks >= 0.5
+            num_targets = int(target_binary.shape[0])
+
+            image_scores = scores[batch_index]
+            keep = image_scores >= self.instance_metric_score_threshold
+            kept_scores = image_scores[keep]
+            kept_logits = pred_masks[batch_index, keep]
+            num_predictions = int(kept_logits.shape[0])
+
+            state["instance_pred_count"] += float(num_predictions)
+            state["instance_gt_count"] += float(num_targets)
+
+            if num_predictions > 0 and num_targets > 0:
+                target_size = tuple(target_binary.shape[-2:])
+                kept_logits = self._crop_or_resize_mask_logits(kept_logits[:, None], target_size)[:, 0]
+                pred_binary = kept_logits.sigmoid() >= self.instance_metric_mask_threshold
+                pairwise_iou = self._pairwise_mask_iou(pred_binary, target_binary)
+            else:
+                pairwise_iou = pred_masks.new_zeros((num_predictions, num_targets))
+
+            for iou_threshold in self.instance_metric_iou_thresholds:
+                suffix = self._iou_suffix(iou_threshold)
+                tp, fp, fn, iou_sum = self._greedy_instance_match_counts(
+                    pairwise_iou,
+                    kept_scores,
+                    iou_threshold,
+                )
+                state[f"instance_tp_{suffix}"] += tp
+                state[f"instance_fp_{suffix}"] += fp
+                state[f"instance_fn_{suffix}"] += fn
+                state[f"instance_iou_sum_{suffix}"] += iou_sum
+
+    @torch.no_grad()
+    def _update_segmentation_metric_state(
+        self,
+        stage: str,
+        outputs: Mapping[str, torch.Tensor],
+        batch: Mapping[str, object],
+    ) -> None:
+        """在验证/测试 step 中更新实例分割指标计数器。"""
+        state = self._get_segmentation_metric_state(stage, outputs["pred_logits"].device)
+        self._update_instance_metric_state(state, outputs, batch)
+
+    def _sum_across_processes(self, value: torch.Tensor) -> torch.Tensor:
+        """分布式训练时把各进程计数器求和，单进程时原样返回。"""
+        try:
+            trainer = self.trainer
+        except RuntimeError:
+            # 单元测试或手动调用 LightningModule hook 时，模块可能还没有绑定 Trainer。
+            # 这种场景必然是单进程本地统计，直接返回当前计数即可。
+            trainer = None
+        if trainer is not None and getattr(trainer, "world_size", 1) > 1:
+            return self.all_gather(value).sum()
+        return value
+
+    def _compute_segmentation_metric_logs(self, stage: str) -> dict[str, torch.Tensor]:
+        """把累积计数器转换为最终写入日志的指标标量。"""
+        state = self._segmentation_metric_states.get(stage)
+        if state is None:
+            return {}
+
+        summed = {name: self._sum_across_processes(value) for name, value in state.items()}
+        eps = torch.as_tensor(1e-6, device=next(iter(summed.values())).device, dtype=torch.float64)
+
+        logs = {
+            f"{stage}_instance_pred_count": summed["instance_pred_count"],
+            f"{stage}_instance_gt_count": summed["instance_gt_count"],
+        }
+
+        for iou_threshold in self.instance_metric_iou_thresholds:
+            suffix = self._iou_suffix(iou_threshold)
+            tp = summed[f"instance_tp_{suffix}"]
+            fp = summed[f"instance_fp_{suffix}"]
+            fn = summed[f"instance_fn_{suffix}"]
+            iou_sum = summed[f"instance_iou_sum_{suffix}"]
+            precision = tp / (tp + fp + eps)
+            recall = tp / (tp + fn + eps)
+            logs[f"{stage}_instance_precision_{suffix}"] = precision
+            logs[f"{stage}_instance_recall_{suffix}"] = recall
+            logs[f"{stage}_instance_f1_{suffix}"] = (2 * precision * recall) / (precision + recall + eps)
+            logs[f"{stage}_instance_mean_iou_{suffix}"] = iou_sum / (tp + eps)
+
+        return logs
+
+    def _log_segmentation_metrics(self, stage: str) -> None:
+        """在 epoch 结束时把实例分割指标写入 Lightning logger。"""
+        logs = self._compute_segmentation_metric_logs(stage)
+        for name, value in logs.items():
+            # 只把最常看的实例 F1 放到进度条，完整指标都会进入 TensorBoard/CSV logger。
+            self.log(
+                name,
+                value,
+                prog_bar=name == f"{stage}_instance_f1_50",
+                logger=True,
+                sync_dist=False,
+            )
 
     def _compute_loss(self, batch):
         """根据当前损失函数类型计算单个 batch 的训练或评估损失。"""
@@ -213,7 +474,9 @@ class MInterface(L.LightningModule):
             if isinstance(loss, dict):
                 # InstanceLoss(return_dict=True) 主要用于调试；训练主 loss 仍使用其中的 loss 字段。
                 loss = loss["loss"]
-            return loss, images, outputs["pred_logits"], None
+            # 验证/测试阶段需要完整输出字典计算语义和实例指标；通用分类 metric 会因为
+            # labels=None 自动跳过，因此这里返回 dict 不会影响其它路径。
+            return loss, images, outputs, None
 
         if isinstance(self.loss_function, LossF):
             images, masks, contours, distances = self._unpack_ftw_batch(batch)
@@ -248,6 +511,8 @@ class MInterface(L.LightningModule):
         # torchmetrics 的 update 会累积当前 batch 的状态，compute 由 Lightning 日志系统触发。
         if metric is not None and labels is not None:
             metric.update(logits, labels)
+        if isinstance(self.loss_function, InstanceLoss) and isinstance(logits, Mapping) and isinstance(batch, Mapping):
+            self._update_segmentation_metric_state(stage, logits, batch)
         # batch_size 用于 Lightning 在 epoch 级别正确加权聚合 loss/metric。
         batch_size = self._batch_size(images)
         self.log(f"{stage}_loss", loss, prog_bar=True, on_epoch=True, batch_size=batch_size)
@@ -265,6 +530,10 @@ class MInterface(L.LightningModule):
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=self._batch_size(images))
         return loss
 
+    def on_validation_epoch_start(self) -> None:
+        """验证 epoch 开始时重置实例/语义分割指标。"""
+        self._reset_segmentation_metric_state("val")
+
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         """验证阶段的单 batch 逻辑。
 
@@ -272,9 +541,21 @@ class MInterface(L.LightningModule):
         """
         return self._shared_eval_step(batch, "val")
 
+    def on_validation_epoch_end(self) -> None:
+        """验证 epoch 结束时记录实例/语义分割指标。"""
+        self._log_segmentation_metrics("val")
+
+    def on_test_epoch_start(self) -> None:
+        """测试 epoch 开始时重置实例/语义分割指标。"""
+        self._reset_segmentation_metric_state("test")
+
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         """测试阶段的单 batch 逻辑，通常与验证逻辑一致。"""
         return self._shared_eval_step(batch, "test")
+
+    def on_test_epoch_end(self) -> None:
+        """测试 epoch 结束时记录实例/语义分割指标。"""
+        self._log_segmentation_metrics("test")
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         """预测阶段的单 batch 逻辑。
